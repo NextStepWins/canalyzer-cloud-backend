@@ -24,7 +24,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 SYSTEM_STATE = {
     "last_heartbeat_time": 0.0,
     "user_is_monitoring": False,
-    "timeout_seconds": 10.0
+    "timeout_seconds": 10.0,
+    "monitoring_by_truck": {}
 }
 
 live_signals_db = {}
@@ -32,6 +33,11 @@ live_signals_db = {}
 class HeartbeatResponse(BaseModel):
     status: str
     user_is_monitoring: bool
+
+class HeartbeatTruckResponse(BaseModel):
+    status: str
+    user_is_monitoring: bool
+    truck_id: str
 
 class BlackboxMetadata(BaseModel):
     truck_id: str
@@ -61,6 +67,15 @@ def get_db_connection():
     if not DATABASE_URL:
         raise HTTPException(status_code=500, detail="DATABASE_URL não configurada.")
     return psycopg2.connect(DATABASE_URL)
+
+def ensure_truck_state(truck_id: str):
+    if truck_id not in SYSTEM_STATE["monitoring_by_truck"]:
+        SYSTEM_STATE["monitoring_by_truck"][truck_id] = {
+            "last_heartbeat_time": 0.0,
+            "user_is_monitoring": False,
+            "timeout_seconds": 10.0
+        }
+    return SYSTEM_STATE["monitoring_by_truck"][truck_id]
 
 def normalize_can_id(raw_id):
     if isinstance(raw_id, int):
@@ -313,7 +328,6 @@ def build_markers_from_workspace_log(workspace_log):
                 continue
 
             decoded = frame.get("decoded", "")
-
             if "Active Diagnostic Trouble Codes" not in decoded:
                 continue
 
@@ -478,6 +492,53 @@ async def check_system_status() -> HeartbeatResponse:
         status="ok",
         user_is_monitoring=SYSTEM_STATE["user_is_monitoring"]
     )
+
+@app.post("/api/heartbeat/{truck_id}")
+async def receive_heartbeat_for_truck(truck_id: str):
+    truck_state = ensure_truck_state(truck_id)
+    truck_state["last_heartbeat_time"] = time.time()
+    truck_state["user_is_monitoring"] = True
+    return {
+        "status": "alive",
+        "truck_id": truck_id,
+        "timestamp": truck_state["last_heartbeat_time"]
+    }
+
+@app.get("/api/status/{truck_id}")
+async def check_system_status_for_truck(truck_id: str) -> HeartbeatTruckResponse:
+    truck_state = ensure_truck_state(truck_id)
+
+    current_time = time.time()
+    time_since_last_pulse = current_time - truck_state["last_heartbeat_time"]
+
+    if time_since_last_pulse > truck_state["timeout_seconds"]:
+        truck_state["user_is_monitoring"] = False
+
+    return HeartbeatTruckResponse(
+        status="ok",
+        user_is_monitoring=truck_state["user_is_monitoring"],
+        truck_id=truck_id
+    )
+
+@app.get("/api/trucks/online")
+def get_online_trucks():
+    now = time.time()
+    trucks = []
+
+    for truck_id, truck_payload in live_signals_db.items():
+        meta = truck_payload.get("__meta__", {})
+        updated_at = meta.get("updated_at", 0.0)
+
+        trucks.append({
+            "truck_id": truck_id,
+            "lat": meta.get("lat", -25.4284),
+            "lon": meta.get("lon", -49.2731),
+            "updated_at": updated_at,
+            "is_recent": (now - updated_at) <= 30.0
+        })
+
+    trucks.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
+    return {"trucks": trucks}
 
 @app.post("/signals")
 async def upload_live_signals(payload: LiveSignalsPayload):
