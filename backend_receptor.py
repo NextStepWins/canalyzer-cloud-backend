@@ -90,13 +90,29 @@ def to_time_label_from_seconds(seconds_float):
     ms = rem % 1000
     return f"{hh:02d}:{mm:02d}:{ss:02d}.{ms:03d}"
 
+DTC_DICT = {
+    "140_2": {"caption": "Engine Oil Pressure", "ftb": "Data Erratic, Intermittent Or Incorrect"},
+    "190_0": {"caption": "Engine Speed", "ftb": "Data Valid But Above Normal Operational Range"},
+    "110_0": {"caption": "Engine Coolant Temperature", "ftb": "Data Valid But Above Normal Range"},
+    "94_1": {"caption": "Engine Fuel Delivery Pressure", "ftb": "Data Valid But Below Normal Range"},
+    "84_9": {"caption": "Wheel-Based Vehicle Speed", "ftb": "Abnormal Update Rate"},
+    "108_3": {"caption": "Barometric Pressure", "ftb": "Voltage Above Normal"},
+    "158_4": {"caption": "Battery Potential / Power Input 1", "ftb": "Voltage Below Normal"}
+}
+
+def get_dtc_text(spn, fmi):
+    key = f"{spn}_{fmi}"
+    return DTC_DICT.get(key, {
+        "caption": f"SPN Não Catalogada ({spn})",
+        "ftb": f"FMI Genérico ({fmi})"
+    })
+
 def decode_eec1(payload_bytes):
     if len(payload_bytes) < 8:
         return None
 
     engine_speed_raw = (payload_bytes[4] << 8) | payload_bytes[3]
     engine_speed = engine_speed_raw * 0.125
-
     driver_demand = payload_bytes[1] * 0.4
 
     return {
@@ -116,7 +132,6 @@ def decode_ccvs(payload_bytes):
 
     vehicle_speed_raw = (payload_bytes[2] << 8) | payload_bytes[1]
     vehicle_speed = vehicle_speed_raw / 256.0
-
     parking_brake = "On" if (payload_bytes[0] & 0x10) else "Off"
 
     return {
@@ -153,7 +168,8 @@ def decode_dm1(payload_bytes):
             "sender": "EMS",
             "receiver": "Diag",
             "decoded": "Diagnostic Message 1",
-            "sigs": {}
+            "sigs": {},
+            "dtc": None
         }
 
     spn = (payload_bytes[2] << 8) | payload_bytes[1]
@@ -166,15 +182,25 @@ def decode_dm1(payload_bytes):
             "sender": "EMS",
             "receiver": "Diag",
             "decoded": "No Active DTCs",
-            "sigs": {}
+            "sigs": {},
+            "dtc": None
         }
+
+    info = get_dtc_text(spn, fmi)
 
     return {
         "message": "DM1",
         "sender": "EMS",
         "receiver": "Diag",
         "decoded": f"Active Diagnostic Trouble Codes | SPN={spn} | FMI={fmi} | OC={oc}",
-        "sigs": {}
+        "sigs": {},
+        "dtc": {
+            "spn": spn,
+            "fmi": fmi,
+            "oc": oc,
+            "caption": info["caption"],
+            "ftb": info["ftb"]
+        }
     }
 
 def parse_known_j1939(frame):
@@ -209,7 +235,8 @@ def parse_known_j1939(frame):
             "dlc": frame.get("dlc", 8),
             "payload": payload_hex,
             "decoded": decoded["decoded"],
-            "sigs": decoded["sigs"]
+            "sigs": decoded.get("sigs", {}),
+            "dtc": decoded.get("dtc")
         }
 
     return {
@@ -220,7 +247,8 @@ def parse_known_j1939(frame):
         "dlc": frame.get("dlc", 8),
         "payload": payload_hex,
         "decoded": "Raw Data",
-        "sigs": {}
+        "sigs": {},
+        "dtc": None
     }
 
 def build_workspace_log(raw_log):
@@ -272,7 +300,132 @@ def build_workspace_log(raw_log):
 
     return workspace_log
 
+def build_markers_from_workspace_log(workspace_log):
+    markers = []
+    seen_active_dtcs = set()
+
+    for entry in workspace_log:
+        time_label = entry.get("time", "00:00:00.000")
+        frames = entry.get("frames", [])
+
+        for frame in frames:
+            if frame.get("message") != "DM1":
+                continue
+
+            decoded = frame.get("decoded", "")
+
+            if "Active Diagnostic Trouble Codes" not in decoded:
+                continue
+
+            spn = None
+            fmi = None
+
+            parts = [p.strip() for p in decoded.split("|")]
+            for part in parts:
+                if part.startswith("SPN="):
+                    try:
+                        spn = int(part.replace("SPN=", "").strip())
+                    except Exception:
+                        pass
+                elif part.startswith("FMI="):
+                    try:
+                        fmi = int(part.replace("FMI=", "").strip())
+                    except Exception:
+                        pass
+
+            if spn is None or fmi is None:
+                continue
+
+            key = f"{spn}_{fmi}"
+            info = get_dtc_text(spn, fmi)
+
+            if key not in seen_active_dtcs:
+                markers.append({
+                    "time": time_label,
+                    "comment": f"⚠️ FALHA: {info['caption']}"
+                })
+                seen_active_dtcs.add(key)
+            else:
+                markers.append({
+                    "time": time_label,
+                    "comment": f"⚠️ REINCIDÊNCIA: {info['caption']}"
+                })
+
+    return markers
+
+def build_dtc_history_from_workspace_log(workspace_log):
+    dtc_history = {}
+
+    for entry in workspace_log:
+        time_label = entry.get("time", "00:00:00.000")
+        frames = entry.get("frames", [])
+
+        active_in_this_cycle = set()
+        dm1_seen = False
+
+        for frame in frames:
+            if frame.get("message") != "DM1":
+                continue
+
+            dm1_seen = True
+            decoded = frame.get("decoded", "")
+
+            if "No Active DTCs" in decoded:
+                continue
+
+            if "Active Diagnostic Trouble Codes" not in decoded:
+                continue
+
+            spn = None
+            fmi = None
+            oc = 0
+
+            parts = [p.strip() for p in decoded.split("|")]
+            for part in parts:
+                if part.startswith("SPN="):
+                    try:
+                        spn = int(part.replace("SPN=", "").strip())
+                    except Exception:
+                        pass
+                elif part.startswith("FMI="):
+                    try:
+                        fmi = int(part.replace("FMI=", "").strip())
+                    except Exception:
+                        pass
+                elif part.startswith("OC="):
+                    try:
+                        oc = int(part.replace("OC=", "").strip())
+                    except Exception:
+                        pass
+
+            if spn is None or fmi is None:
+                continue
+
+            key = f"{spn}_{fmi}"
+            active_in_this_cycle.add(key)
+            info = get_dtc_text(spn, fmi)
+
+            dtc_history[key] = {
+                "spn": spn,
+                "fmi": fmi,
+                "caption": info["caption"],
+                "ftb": info["ftb"],
+                "status": "Ativa",
+                "oc": oc,
+                "lastTime": time_label
+            }
+
+        if dm1_seen:
+            for key in list(dtc_history.keys()):
+                if key not in active_in_this_cycle:
+                    dtc_history[key]["status"] = "Inativa"
+
+    return dtc_history
+
 def build_offline_package(log_id, metadata, raw_log, workspace_log):
+    markers = build_markers_from_workspace_log(workspace_log)
+    dtc_history = build_dtc_history_from_workspace_log(workspace_log)
+
     return {
         "version": "3.0",
         "timestamp": metadata.get("timestamp"),
@@ -285,7 +438,7 @@ def build_offline_package(log_id, metadata, raw_log, workspace_log):
             "configs": {},
             "showCursors": True,
             "cursorCount": 2,
-            "markers": [],
+            "markers": markers,
             "layout": "overlay",
             "smooth": True
         },
@@ -301,7 +454,7 @@ def build_offline_package(log_id, metadata, raw_log, workspace_log):
             "key": "id",
             "direction": "asc"
         },
-        "dtcHistory": {},
+        "dtcHistory": dtc_history,
         "globalSignalDict": {},
         "log": workspace_log,
         "raw_log": raw_log
@@ -411,6 +564,7 @@ def upload_blackbox_log(payload: BlackboxUpload):
         "log_id": log_id,
         "workspace_frames": len(workspace_log),
         "raw_frames": len(raw_log),
+        "markers": len(offline_package["uiState"]["markers"]),
         "message": "Caixa preta armazenada no Supabase."
     }
 
