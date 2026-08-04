@@ -80,63 +80,6 @@ def payload_to_hex(data_bytes):
         return ""
     return " ".join(f"{int(b) & 0xFF:02X}" for b in data_bytes)
 
-def is_dm1_frame(can_id_hex):
-    return "FECA" in can_id_hex.upper()
-
-def parse_dm1(decoded_payload_hex):
-    try:
-        parts = decoded_payload_hex.split()
-        if len(parts) < 4:
-            return None
-        spn = (int(parts[2], 16) << 8) | int(parts[1], 16)
-        fmi = int(parts[3], 16) & 0x1F
-        oc = int(parts[3], 16) >> 7
-        if spn == 0:
-            return {
-                "message": "DM1",
-                "decoded": "No Active DTCs",
-                "sigs": {}
-            }
-        return {
-            "message": "DM1",
-            "decoded": f"Active Diagnostic Trouble Codes | SPN={spn} | FMI={fmi} | OC={oc}",
-            "sigs": {}
-        }
-    except Exception:
-        return {
-            "message": "DM1",
-            "decoded": "Diagnostic Message 1",
-            "sigs": {}
-        }
-
-def parse_j1939_fallback(frame):
-    can_id_hex = normalize_can_id(frame.get("id"))
-    payload_hex = payload_to_hex(frame.get("d", []))
-    if is_dm1_frame(can_id_hex):
-        dm1 = parse_dm1(payload_hex)
-        if dm1:
-            return {
-                "id": can_id_hex,
-                "message": dm1["message"],
-                "sender": "ECU Desconhecida",
-                "receiver": "Broadcast",
-                "dlc": frame.get("dlc", 8),
-                "payload": payload_hex,
-                "decoded": dm1["decoded"],
-                "sigs": dm1["sigs"]
-            }
-
-    return {
-        "id": can_id_hex,
-        "message": f"Unknown PGN {((int(can_id_hex, 16) >> 8) & 0x3FFFF)}" if can_id_hex.startswith("0x") else "Unknown",
-        "sender": "ECU Desconhecida",
-        "receiver": "Broadcast",
-        "dlc": frame.get("dlc", 8),
-        "payload": payload_hex,
-        "decoded": "Raw Data",
-        "sigs": {}
-    }
-
 def to_time_label_from_seconds(seconds_float):
     total_ms = int(round(max(seconds_float, 0) * 1000))
     hh = total_ms // 3600000
@@ -146,6 +89,139 @@ def to_time_label_from_seconds(seconds_float):
     ss = rem // 1000
     ms = rem % 1000
     return f"{hh:02d}:{mm:02d}:{ss:02d}.{ms:03d}"
+
+def decode_eec1(payload_bytes):
+    if len(payload_bytes) < 8:
+        return None
+
+    engine_speed_raw = (payload_bytes[4] << 8) | payload_bytes[3]
+    engine_speed = engine_speed_raw * 0.125
+
+    driver_demand = payload_bytes[1] * 0.4
+
+    return {
+        "message": "EEC1",
+        "sender": "EMS",
+        "receiver": "Global",
+        "decoded": f"EngineSpeed={engine_speed:.2f} rpm | DriverDemand={driver_demand:.2f} %",
+        "sigs": {
+            "EngineSpeed": engine_speed,
+            "DriverDemand": driver_demand
+        }
+    }
+
+def decode_ccvs(payload_bytes):
+    if len(payload_bytes) < 8:
+        return None
+
+    vehicle_speed_raw = (payload_bytes[2] << 8) | payload_bytes[1]
+    vehicle_speed = vehicle_speed_raw / 256.0
+
+    parking_brake = "On" if (payload_bytes[0] & 0x10) else "Off"
+
+    return {
+        "message": "CCVS",
+        "sender": "VMCU",
+        "receiver": "Cluster",
+        "decoded": f"VehicleSpeed={vehicle_speed:.2f} km/h | ParkingBrake={parking_brake}",
+        "sigs": {
+            "VehicleSpeed": vehicle_speed
+        }
+    }
+
+def decode_ic1(payload_bytes):
+    if len(payload_bytes) < 8:
+        return None
+
+    boost_raw = payload_bytes[1]
+    boost_pressure = boost_raw * 0.01
+
+    return {
+        "message": "IC1",
+        "sender": "EMS",
+        "receiver": "Global",
+        "decoded": f"BoostPressure={boost_pressure:.2f} bar",
+        "sigs": {
+            "BoostPressure": boost_pressure
+        }
+    }
+
+def decode_dm1(payload_bytes):
+    if len(payload_bytes) < 4:
+        return {
+            "message": "DM1",
+            "sender": "EMS",
+            "receiver": "Diag",
+            "decoded": "Diagnostic Message 1",
+            "sigs": {}
+        }
+
+    spn = (payload_bytes[2] << 8) | payload_bytes[1]
+    fmi = payload_bytes[3] & 0x1F
+    oc = payload_bytes[3] >> 7
+
+    if spn == 0:
+        return {
+            "message": "DM1",
+            "sender": "EMS",
+            "receiver": "Diag",
+            "decoded": "No Active DTCs",
+            "sigs": {}
+        }
+
+    return {
+        "message": "DM1",
+        "sender": "EMS",
+        "receiver": "Diag",
+        "decoded": f"Active Diagnostic Trouble Codes | SPN={spn} | FMI={fmi} | OC={oc}",
+        "sigs": {}
+    }
+
+def parse_known_j1939(frame):
+    can_id = frame.get("id")
+    can_id_hex = normalize_can_id(can_id)
+    payload_bytes = frame.get("d", []) or []
+    payload_hex = payload_to_hex(payload_bytes)
+
+    pgn = None
+    try:
+        pgn = (int(can_id) >> 8) & 0x3FFFF if isinstance(can_id, int) else (int(can_id_hex, 16) >> 8) & 0x3FFFF
+    except Exception:
+        pgn = None
+
+    decoded = None
+
+    if pgn == 61444:
+        decoded = decode_eec1(payload_bytes)
+    elif pgn == 65265:
+        decoded = decode_ccvs(payload_bytes)
+    elif pgn == 65270:
+        decoded = decode_ic1(payload_bytes)
+    elif pgn == 65226:
+        decoded = decode_dm1(payload_bytes)
+
+    if decoded:
+        return {
+            "id": can_id_hex,
+            "message": decoded["message"],
+            "sender": decoded["sender"],
+            "receiver": decoded["receiver"],
+            "dlc": frame.get("dlc", 8),
+            "payload": payload_hex,
+            "decoded": decoded["decoded"],
+            "sigs": decoded["sigs"]
+        }
+
+    return {
+        "id": can_id_hex,
+        "message": f"Unknown PGN {pgn}" if pgn is not None else "Unknown",
+        "sender": "ECU Desconhecida",
+        "receiver": "Broadcast",
+        "dlc": frame.get("dlc", 8),
+        "payload": payload_hex,
+        "decoded": "Raw Data",
+        "sigs": {}
+    }
 
 def build_workspace_log(raw_log):
     if not isinstance(raw_log, list) or not raw_log:
@@ -165,12 +241,14 @@ def build_workspace_log(raw_log):
     base_t = ordered_ts[0] if ordered_ts else 0
 
     workspace_log = []
+
     for t in ordered_ts:
         frames_out = []
         sigs = {}
 
         for frame in grouped[t]:
-            parsed = parse_j1939_fallback(frame)
+            parsed = parse_known_j1939(frame)
+
             frames_out.append({
                 "id": parsed["id"],
                 "message": parsed["message"],
@@ -180,6 +258,7 @@ def build_workspace_log(raw_log):
                 "payload": parsed["payload"],
                 "decoded": parsed["decoded"]
             })
+
             if parsed["sigs"]:
                 sigs.update(parsed["sigs"])
 
@@ -228,13 +307,13 @@ def build_offline_package(log_id, metadata, raw_log, workspace_log):
         "raw_log": raw_log
     }
 
-@app.post("/api/heartbeat", summary="Recebe o pulso do Frontend (Dashboard)")
+@app.post("/api/heartbeat")
 async def receive_heartbeat():
     SYSTEM_STATE["last_heartbeat_time"] = time.time()
     SYSTEM_STATE["user_is_monitoring"] = True
     return {"status": "alive", "timestamp": SYSTEM_STATE["last_heartbeat_time"]}
 
-@app.get("/api/status", summary="ESP32 Consulta o Status da Operação")
+@app.get("/api/status")
 async def check_system_status() -> HeartbeatResponse:
     current_time = time.time()
     time_since_last_pulse = current_time - SYSTEM_STATE["last_heartbeat_time"]
@@ -247,7 +326,7 @@ async def check_system_status() -> HeartbeatResponse:
         user_is_monitoring=SYSTEM_STATE["user_is_monitoring"]
     )
 
-@app.post("/signals", summary="ESP32 envia frames CAN em tempo real (Streaming)")
+@app.post("/signals")
 async def upload_live_signals(payload: LiveSignalsPayload):
     truck = payload.truck_id
     if truck not in live_signals_db:
@@ -265,7 +344,7 @@ async def upload_live_signals(payload: LiveSignalsPayload):
 
     return {"status": "success", "processed_frames": len(payload.frames)}
 
-@app.get("/signals", summary="Frontend consome frames em tempo real")
+@app.get("/signals")
 async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
     if truck_id in live_signals_db:
         truck_data = live_signals_db[truck_id].copy()
@@ -279,7 +358,7 @@ async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
         }
     return {"status": "empty", "data": {}}
 
-@app.post("/api/blackbox/upload", summary="ESP32 Envia o Log Pós-Falha (Bulk Upload)")
+@app.post("/api/blackbox/upload")
 def upload_blackbox_log(payload: BlackboxUpload):
     log_id = f"log_caixa_preta_{str(uuid.uuid4())[:8]}"
 
@@ -335,7 +414,7 @@ def upload_blackbox_log(payload: BlackboxUpload):
         "message": "Caixa preta armazenada no Supabase."
     }
 
-@app.get("/api/blackbox/events", summary="Frontend Solicita Pontos do Mapa")
+@app.get("/api/blackbox/events")
 def get_blackbox_events():
     try:
         conn = get_db_connection()
@@ -364,7 +443,7 @@ def get_blackbox_events():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao buscar eventos: {str(e)}")
 
-@app.get("/api/blackbox/download/{log_id}", summary="Frontend Baixa o Arquivo Completo")
+@app.get("/api/blackbox/download/{log_id}")
 def download_blackbox_log(log_id: str):
     try:
         conn = get_db_connection()
@@ -386,7 +465,7 @@ def download_blackbox_log(log_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao baixar log: {str(e)}")
 
-@app.get("/api/blackbox/offline/{log_id}", summary="Baixa pacote compatível com modo offline")
+@app.get("/api/blackbox/offline/{log_id}")
 def download_blackbox_offline(log_id: str):
     try:
         conn = get_db_connection()
@@ -410,7 +489,7 @@ def download_blackbox_offline(log_id: str):
             return offline_package
 
         metadata = payload.get("metadata", {})
-        raw_log = payload.get("raw_log", payload.get("log", []))
+        raw_log = payload.get("raw_log", [])
         workspace_log = payload.get("workspace_log", build_workspace_log(raw_log))
 
         return build_offline_package(
@@ -424,7 +503,7 @@ def download_blackbox_offline(log_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao montar pacote offline: {str(e)}")
 
-@app.get("/api/blackbox/direct/{log_id}", summary="Consulta resumida do log completo")
+@app.get("/api/blackbox/direct/{log_id}")
 def get_blackbox_direct(log_id: str):
     try:
         conn = get_db_connection()
