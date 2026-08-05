@@ -30,6 +30,7 @@ SYSTEM_STATE = {
 
 live_signals_db = {}
 LIVE_DATA_TIMEOUT_SECONDS = 5.0
+MAX_LIVE_FRAMES_PER_TRUCK = 2000
 
 class HeartbeatResponse(BaseModel):
     status: str
@@ -193,6 +194,11 @@ def decode_eec1(payload_bytes):
         sigs["DriverDemand"] = driver_demand
         parts.append(f"DriverDemand={driver_demand:.2f} %")
 
+    if len(payload_bytes) > 1 and payload_bytes[1] != 0xFF:
+        actual_torque = payload_bytes[1] - 125
+        sigs["ActualTorque"] = actual_torque
+        parts.append(f"ActualTorque={actual_torque:.2f} %")
+
     return {"message": "EEC1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
 
 def decode_eec2(payload_bytes):
@@ -215,6 +221,11 @@ def decode_ccvs1(payload_bytes):
         spd = spd_raw / 256.0
         sigs["VehicleSpeed"] = spd
         parts.append(f"VehicleSpeed={spd:.2f} km/h")
+
+    if len(payload_bytes) > 0 and payload_bytes[0] != 0xFF:
+        parking_brake = 1 if (payload_bytes[0] & 0x10) else 0
+        sigs["ParkingBrake"] = parking_brake
+        parts.append(f"ParkingBrake={'On' if parking_brake else 'Off'}")
 
     return {"message": "CCVS1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
 
@@ -239,6 +250,36 @@ def decode_et1(payload_bytes):
         parts.append(f"EngineCoolantTemp={coolant:.2f} °C")
 
     return {"message": "ET1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
+
+def decode_lfe1(payload_bytes):
+    sigs = {}
+    parts = []
+
+    fuel_raw = le_u16(payload_bytes, 0)
+    if fuel_raw is not None and fuel_raw != 0xFFFF:
+        fuel_rate = fuel_raw * 0.05
+        sigs["FuelRate"] = fuel_rate
+        parts.append(f"FuelRate={fuel_rate:.2f} L/h")
+
+    eco_raw = le_u16(payload_bytes, 2)
+    if eco_raw is not None and eco_raw != 0xFFFF:
+        fuel_eco = eco_raw * 0.001953125
+        sigs["FuelEconomy"] = fuel_eco
+        parts.append(f"FuelEconomy={fuel_eco:.2f} km/L")
+
+    return {"message": "LFE1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
+
+def decode_vdhr(payload_bytes):
+    sigs = {}
+    parts = []
+
+    if len(payload_bytes) > 3 and not all(v == 0xFF for v in payload_bytes[:4]):
+        raw = payload_bytes[0] + (payload_bytes[1] << 8) + (payload_bytes[2] << 16) + (payload_bytes[3] << 24)
+        meters = raw * 5.0
+        sigs["Odometer_m"] = meters
+        parts.append(f"Odometer={meters:.0f} m")
+
+    return {"message": "VDHR", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
 
 def decode_dm1(payload_bytes):
     if len(payload_bytes) < 4:
@@ -300,6 +341,10 @@ def parse_known_j1939(frame):
         decoded = decode_ic1(payload_bytes)
     elif pgn == 65262:
         decoded = decode_et1(payload_bytes)
+    elif pgn == 65266:
+        decoded = decode_lfe1(payload_bytes)
+    elif pgn == 65217:
+        decoded = decode_vdhr(payload_bytes)
     elif pgn == 65226:
         decoded = decode_dm1(payload_bytes)
 
@@ -603,13 +648,22 @@ def get_online_trucks():
 @app.post("/signals")
 async def upload_live_signals(payload: LiveSignalsPayload):
     truck = payload.truck_id
+
     if truck not in live_signals_db:
-        live_signals_db[truck] = {}
+        live_signals_db[truck] = {
+            "frames": [],
+            "__meta__": {}
+        }
+
+    truck_bucket = live_signals_db[truck]
 
     for frame in payload.frames:
-        live_signals_db[truck][frame.id] = frame.dict()
+        truck_bucket["frames"].append(frame.dict())
 
-    live_signals_db[truck]["__meta__"] = {
+    if len(truck_bucket["frames"]) > MAX_LIVE_FRAMES_PER_TRUCK:
+        truck_bucket["frames"] = truck_bucket["frames"][-MAX_LIVE_FRAMES_PER_TRUCK:]
+
+    truck_bucket["__meta__"] = {
         "truck_id": payload.truck_id,
         "lat": payload.lat,
         "lon": payload.lon,
@@ -621,24 +675,27 @@ async def upload_live_signals(payload: LiveSignalsPayload):
 @app.get("/signals")
 async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
     if truck_id not in live_signals_db:
-        return {"status": "empty", "data": {}, "truck_id": truck_id}
+        return {"status": "empty", "frames": [], "truck_id": truck_id}
 
-    truck_data = live_signals_db[truck_id].copy()
-    meta = truck_data.pop("__meta__", {})
+    truck_data = live_signals_db[truck_id]
+    meta = truck_data.get("__meta__", {})
     updated_at = meta.get("updated_at", 0.0)
 
     if (time.time() - updated_at) > LIVE_DATA_TIMEOUT_SECONDS:
         return {
             "status": "stale",
-            "data": {},
+            "frames": [],
             "truck_id": truck_id,
             "lat": meta.get("lat", -25.4284),
             "lon": meta.get("lon", -49.2731)
         }
 
+    frames_to_deliver = truck_data.get("frames", [])[:]
+    truck_data["frames"] = []
+
     return {
         "status": "success",
-        "data": truck_data,
+        "frames": frames_to_deliver,
         "truck_id": meta.get("truck_id", truck_id),
         "lat": meta.get("lat", -25.4284),
         "lon": meta.get("lon", -49.2731)
@@ -723,7 +780,8 @@ def get_blackbox_events():
                 "event_summary": event_summary,
                 "metadata": metadata,
                 "workspace_log": payload.get("workspace_log", []),
-                "raw_log": payload.get("raw_log", [])
+                "raw_log": payload.get("raw_log", []),
+                "offline_package": payload.get("offline_package")
             })
 
         return {"events": events}
