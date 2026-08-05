@@ -823,3 +823,4 @@ def get_blackbox_direct(log_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro na consulta direta: {str(e)}")
+We need answer with adjusted backend only, preserving logic, add frames batch and maybe status by truck. mention current issue and provide full code. Since no time.
