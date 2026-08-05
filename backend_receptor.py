@@ -24,7 +24,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 SYSTEM_STATE = {
     "last_heartbeat_time": 0.0,
     "user_is_monitoring": False,
-    "timeout_seconds": 10.0
+    "timeout_seconds": 10.0,
+    "monitoring_by_truck": {}
 }
 
 live_signals_db = {}
@@ -32,6 +33,11 @@ live_signals_db = {}
 class HeartbeatResponse(BaseModel):
     status: str
     user_is_monitoring: bool
+
+class HeartbeatTruckResponse(BaseModel):
+    status: str
+    user_is_monitoring: bool
+    truck_id: str
 
 class BlackboxMetadata(BaseModel):
     truck_id: str
@@ -83,6 +89,15 @@ def get_db_connection():
     if not DATABASE_URL:
         raise HTTPException(status_code=500, detail="DATABASE_URL não configurada.")
     return psycopg2.connect(DATABASE_URL)
+
+def ensure_truck_state(truck_id: str):
+    if truck_id not in SYSTEM_STATE["monitoring_by_truck"]:
+        SYSTEM_STATE["monitoring_by_truck"][truck_id] = {
+            "last_heartbeat_time": 0.0,
+            "user_is_monitoring": False,
+            "timeout_seconds": 10.0
+        }
+    return SYSTEM_STATE["monitoring_by_truck"][truck_id]
 
 def get_dtc_text(spn, fmi):
     key = f"{spn}_{fmi}"
@@ -177,11 +192,6 @@ def decode_eec1(payload_bytes):
         sigs["DriverDemand"] = driver_demand
         parts.append(f"DriverDemand={driver_demand:.2f} %")
 
-    if len(payload_bytes) > 1 and payload_bytes[1] != 0xFF:
-        actual_torque = payload_bytes[1] - 125
-        sigs["ActualTorque"] = actual_torque
-        parts.append(f"ActualTorque={actual_torque:.2f} %")
-
     return {"message": "EEC1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
 
 def decode_eec2(payload_bytes):
@@ -205,41 +215,7 @@ def decode_ccvs1(payload_bytes):
         sigs["VehicleSpeed"] = spd
         parts.append(f"VehicleSpeed={spd:.2f} km/h")
 
-    if len(payload_bytes) > 0 and payload_bytes[0] != 0xFF:
-        parking_brake = 1 if (payload_bytes[0] & 0x10) else 0
-        sigs["ParkingBrake"] = parking_brake
-        parts.append(f"ParkingBrake={'On' if parking_brake else 'Off'}")
-
     return {"message": "CCVS1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
-
-def decode_et1(payload_bytes):
-    sigs = {}
-    parts = []
-
-    if len(payload_bytes) > 0 and payload_bytes[0] != 0xFF:
-        coolant = payload_bytes[0] - 40
-        sigs["EngineCoolantTemp"] = coolant
-        parts.append(f"EngineCoolantTemp={coolant:.2f} °C")
-
-    return {"message": "ET1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
-
-def decode_lfe1(payload_bytes):
-    sigs = {}
-    parts = []
-
-    fuel_raw = le_u16(payload_bytes, 0)
-    if fuel_raw is not None and fuel_raw != 0xFFFF:
-        fuel_rate = fuel_raw * 0.05
-        sigs["FuelRate"] = fuel_rate
-        parts.append(f"FuelRate={fuel_rate:.2f} L/h")
-
-    eco_raw = le_u16(payload_bytes, 2)
-    if eco_raw is not None and eco_raw != 0xFFFF:
-        fuel_eco = eco_raw * 0.001953125
-        sigs["FuelEconomy"] = fuel_eco
-        parts.append(f"FuelEconomy={fuel_eco:.2f} km/L")
-
-    return {"message": "LFE1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
 
 def decode_ic1(payload_bytes):
     sigs = {}
@@ -252,17 +228,16 @@ def decode_ic1(payload_bytes):
 
     return {"message": "IC1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
 
-def decode_vdhr(payload_bytes):
+def decode_et1(payload_bytes):
     sigs = {}
     parts = []
 
-    if len(payload_bytes) > 3 and not all(v == 0xFF for v in payload_bytes[:4]):
-        raw = payload_bytes[0] | (payload_bytes[1] << 8) | (payload_bytes[2] << 16) | (payload_bytes[3] << 24)
-        meters = raw * 5.0
-        sigs["Odometer_m"] = meters
-        parts.append(f"Odometer={meters:.0f} m")
+    if len(payload_bytes) > 0 and payload_bytes[0] != 0xFF:
+        coolant = payload_bytes[0] - 40
+        sigs["EngineCoolantTemp"] = coolant
+        parts.append(f"EngineCoolantTemp={coolant:.2f} °C")
 
-    return {"message": "VDHR", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
+    return {"message": "ET1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
 
 def decode_dm1(payload_bytes):
     if len(payload_bytes) < 4:
@@ -275,7 +250,7 @@ def decode_dm1(payload_bytes):
 
     spn = (payload_bytes[2] << 8) | payload_bytes[1]
     fmi = payload_bytes[3] & 0x1F
-    oc = payload_bytes[4] if len(payload_bytes) > 4 else (payload_bytes[3] >> 7)
+    oc = payload_bytes[4] if len(payload_bytes) > 4 else 0
 
     if spn == 0:
         return {
@@ -311,7 +286,6 @@ def parse_known_j1939(frame):
     payload_hex = payload_to_hex(payload_bytes)
 
     meta = decode_j1939_id(can_id)
-
     pgn = meta["pgn"]
     decoded = None
 
@@ -321,14 +295,10 @@ def parse_known_j1939(frame):
         decoded = decode_eec2(payload_bytes)
     elif pgn == 65265:
         decoded = decode_ccvs1(payload_bytes)
-    elif pgn == 65262:
-        decoded = decode_et1(payload_bytes)
-    elif pgn == 65266:
-        decoded = decode_lfe1(payload_bytes)
     elif pgn == 65270:
         decoded = decode_ic1(payload_bytes)
-    elif pgn == 65217:
-        decoded = decode_vdhr(payload_bytes)
+    elif pgn == 65262:
+        decoded = decode_et1(payload_bytes)
     elif pgn == 65226:
         decoded = decode_dm1(payload_bytes)
 
@@ -463,7 +433,6 @@ def build_dtc_history_from_workspace_log(workspace_log):
     for entry in workspace_log:
         time_label = entry.get("time", "00:00:00.000")
         frames = entry.get("frames", [])
-
         active_in_this_cycle = set()
         dm1_seen = False
 
@@ -583,6 +552,53 @@ async def check_system_status() -> HeartbeatResponse:
         user_is_monitoring=SYSTEM_STATE["user_is_monitoring"]
     )
 
+@app.post("/api/heartbeat/{truck_id}")
+async def receive_heartbeat_for_truck(truck_id: str):
+    truck_state = ensure_truck_state(truck_id)
+    truck_state["last_heartbeat_time"] = time.time()
+    truck_state["user_is_monitoring"] = True
+    return {
+        "status": "alive",
+        "truck_id": truck_id,
+        "timestamp": truck_state["last_heartbeat_time"]
+    }
+
+@app.get("/api/status/{truck_id}")
+async def check_system_status_for_truck(truck_id: str) -> HeartbeatTruckResponse:
+    truck_state = ensure_truck_state(truck_id)
+
+    current_time = time.time()
+    time_since_last_pulse = current_time - truck_state["last_heartbeat_time"]
+
+    if time_since_last_pulse > truck_state["timeout_seconds"]:
+        truck_state["user_is_monitoring"] = False
+
+    return HeartbeatTruckResponse(
+        status="ok",
+        user_is_monitoring=truck_state["user_is_monitoring"],
+        truck_id=truck_id
+    )
+
+@app.get("/api/trucks/online")
+def get_online_trucks():
+    now = time.time()
+    trucks = []
+
+    for truck_id, truck_payload in live_signals_db.items():
+        meta = truck_payload.get("__meta__", {})
+        updated_at = meta.get("updated_at", 0.0)
+
+        trucks.append({
+            "truck_id": truck_id,
+            "lat": meta.get("lat", -25.4284),
+            "lon": meta.get("lon", -49.2731),
+            "updated_at": updated_at,
+            "is_recent": (now - updated_at) <= 30.0
+        })
+
+    trucks.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
+    return {"trucks": trucks}
+
 @app.post("/signals")
 async def upload_live_signals(payload: LiveSignalsPayload):
     truck = payload.truck_id
@@ -613,7 +629,7 @@ async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
             "lat": meta.get("lat", -25.4284),
             "lon": meta.get("lon", -49.2731)
         }
-    return {"status": "empty", "data": {}}
+    return {"status": "empty", "data": {}, "truck_id": truck_id}
 
 @app.post("/api/blackbox/upload")
 def upload_blackbox_log(payload: BlackboxUpload):
