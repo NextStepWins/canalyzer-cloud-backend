@@ -29,6 +29,7 @@ SYSTEM_STATE = {
 }
 
 live_signals_db = {}
+LIVE_DATA_TIMEOUT_SECONDS = 5.0
 
 class HeartbeatResponse(BaseModel):
     status: str
@@ -619,17 +620,29 @@ async def upload_live_signals(payload: LiveSignalsPayload):
 
 @app.get("/signals")
 async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
-    if truck_id in live_signals_db:
-        truck_data = live_signals_db[truck_id].copy()
-        meta = truck_data.pop("__meta__", {})
+    if truck_id not in live_signals_db:
+        return {"status": "empty", "data": {}, "truck_id": truck_id}
+
+    truck_data = live_signals_db[truck_id].copy()
+    meta = truck_data.pop("__meta__", {})
+    updated_at = meta.get("updated_at", 0.0)
+
+    if (time.time() - updated_at) > LIVE_DATA_TIMEOUT_SECONDS:
         return {
-            "status": "success",
-            "data": truck_data,
-            "truck_id": meta.get("truck_id", truck_id),
+            "status": "stale",
+            "data": {},
+            "truck_id": truck_id,
             "lat": meta.get("lat", -25.4284),
             "lon": meta.get("lon", -49.2731)
         }
-    return {"status": "empty", "data": {}, "truck_id": truck_id}
+
+    return {
+        "status": "success",
+        "data": truck_data,
+        "truck_id": meta.get("truck_id", truck_id),
+        "lat": meta.get("lat", -25.4284),
+        "lon": meta.get("lon", -49.2731)
+    }
 
 @app.post("/api/blackbox/upload")
 def upload_blackbox_log(payload: BlackboxUpload):
