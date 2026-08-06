@@ -66,6 +66,12 @@ class LiveSignalsPayload(BaseModel):
     lat: float | None = None
     lon: float | None = None
 
+class TruckRegisterPayload(BaseModel):
+    truck_id: str
+    lat: float | None = None
+    lon: float | None = None
+    mode: str | None = "sentinel"
+
 DTC_DICT = {
     "140_2": {"caption": "Engine Oil Pressure", "ftb": "Data Erratic, Intermittent Or Incorrect"},
     "190_0": {"caption": "Engine Speed", "ftb": "Data Valid But Above Normal Operational Range"},
@@ -650,6 +656,29 @@ async def check_system_status_for_truck(truck_id: str) -> HeartbeatTruckResponse
         truck_id=truck_id
     )
 
+@app.post("/api/trucks/register")
+def register_truck(payload: TruckRegisterPayload):
+    truck = payload.truck_id
+
+    if truck not in live_signals_db:
+        live_signals_db[truck] = {
+            "frames": [],
+            "__meta__": {}
+        }
+
+    live_signals_db[truck]["__meta__"] = {
+        "truck_id": payload.truck_id,
+        "lat": payload.lat,
+        "lon": payload.lon,
+        "updated_at": time.time(),
+        "mode": payload.mode or "sentinel"
+    }
+
+    return {
+        "status": "registered",
+        "truck_id": payload.truck_id
+    }
+
 @app.get("/api/trucks/online")
 def get_online_trucks():
     now = time.time()
@@ -664,7 +693,8 @@ def get_online_trucks():
             "lat": meta.get("lat", -25.4284),
             "lon": meta.get("lon", -49.2731),
             "updated_at": updated_at,
-            "is_recent": (now - updated_at) <= 30.0
+            "is_recent": (now - updated_at) <= 30.0,
+            "mode": meta.get("mode", "unknown")
         })
 
     trucks.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
@@ -688,11 +718,13 @@ async def upload_live_signals(payload: LiveSignalsPayload):
     if len(truck_bucket["frames"]) > MAX_LIVE_FRAMES_PER_TRUCK:
         truck_bucket["frames"] = truck_bucket["frames"][-MAX_LIVE_FRAMES_PER_TRUCK:]
 
+    current_meta = truck_bucket.get("__meta__", {})
     truck_bucket["__meta__"] = {
         "truck_id": payload.truck_id,
         "lat": payload.lat,
         "lon": payload.lon,
-        "updated_at": time.time()
+        "updated_at": time.time(),
+        "mode": current_meta.get("mode", "online")
     }
 
     return {"status": "success", "processed_frames": len(payload.frames)}
