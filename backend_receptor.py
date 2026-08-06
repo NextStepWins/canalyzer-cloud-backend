@@ -24,7 +24,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 SYSTEM_STATE = {
     "last_heartbeat_time": 0.0,
     "user_is_monitoring": False,
-    "timeout_seconds": 20.0,
+    "timeout_seconds": 30.0,
     "monitoring_by_truck": {}
 }
 
@@ -119,7 +119,7 @@ def ensure_truck_state(truck_id: str):
         SYSTEM_STATE["monitoring_by_truck"][truck_id] = {
             "last_heartbeat_time": 0.0,
             "user_is_monitoring": False,
-            "timeout_seconds": 20.0
+            "timeout_seconds": 30.0
         }
     return SYSTEM_STATE["monitoring_by_truck"][truck_id]
 
@@ -707,6 +707,16 @@ async def receive_heartbeat_for_truck(truck_id: str):
         "timestamp": truck_state["last_heartbeat_time"]
     }
 
+@app.post("/api/heartbeat/stop/{truck_id}")
+async def stop_heartbeat_for_truck(truck_id: str):
+    truck_state = ensure_truck_state(truck_id)
+    truck_state["last_heartbeat_time"] = 0.0
+    truck_state["user_is_monitoring"] = False
+    return {
+        "status": "stopped",
+        "truck_id": truck_id
+    }
+
 @app.get("/api/status/{truck_id}")
 async def check_system_status_for_truck(truck_id: str) -> HeartbeatTruckResponse:
     truck_state = ensure_truck_state(truck_id)
@@ -910,7 +920,7 @@ def upload_blackbox_chunk(payload: BlackboxChunkUpload):
         del pending_blackbox_chunks[upload_id]
 
         return {
-            "status": "assembled",
+            "status": "success",
             "upload_id": upload_id,
             **result
         }
