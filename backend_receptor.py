@@ -161,7 +161,7 @@ def to_time_label_from_seconds(seconds_float):
 def decode_j1939_id(raw_id):
     id_int = int(raw_id)
     priority = (id_int >> 26) & 0x7
-    dp = (idInt >> 24) & 0x1
+    dp = (id_int >> 24) & 0x1
     pf = (id_int >> 16) & 0xFF
     ps = (id_int >> 8) & 0xFF
     sa = id_int & 0xFF
@@ -403,7 +403,7 @@ def parse_known_j1939(frame):
         "id": can_id_hex,
         "message": f"Unknown PGN {pgn}",
         "sender": format_sender(meta["sa"]),
-        "receiver": formatReceiver(meta),
+        "receiver": format_receiver(meta),
         "dlc": frame.get("dlc", 8),
         "payload": payload_hex,
         "decoded": "Raw Data",
@@ -871,20 +871,35 @@ def upload_blackbox_chunk(payload: BlackboxChunkUpload):
             }
 
         bucket = pending_blackbox_chunks[upload_id]
+
+        bucket["metadata"] = payload.metadata.dict()
+        bucket["chunk_total"] = payload.chunk_total
         bucket["received"][payload.chunk_index] = [frame.dict() for frame in payload.frames]
 
         received_count = len(bucket["received"])
-        if received_count < bucket["chunk_total"]:
+        expected_total = bucket["chunk_total"]
+
+        if received_count < expected_total:
             return {
                 "status": "partial",
                 "upload_id": upload_id,
                 "received_chunks": received_count,
-                "chunk_total": bucket["chunk_total"]
+                "chunk_total": expected_total
+            }
+
+        missing_chunks = [idx for idx in range(expected_total) if idx not in bucket["received"]]
+        if missing_chunks:
+            return {
+                "status": "partial_missing",
+                "upload_id": upload_id,
+                "received_chunks": received_count,
+                "chunk_total": expected_total,
+                "missing_chunks": missing_chunks
             }
 
         full_log = []
-        for idx in range(bucket["chunk_total"]):
-            full_log.extend(bucket["received"].get(idx, []))
+        for idx in range(expected_total):
+            full_log.extend(bucket["received"][idx])
 
         result = persist_blackbox_record(
             metadata_dict=bucket["metadata"],
