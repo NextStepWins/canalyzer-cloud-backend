@@ -73,6 +73,11 @@ class TruckRegisterPayload(BaseModel):
     lat: float | None = None
     lon: float | None = None
     mode: str | None = "sentinel"
+    priority_mode: Optional[bool] = False
+    pending_blackbox_upload: Optional[bool] = False
+    blackbox_locked_until_upload: Optional[bool] = False
+    last_error: Optional[str] = ""
+    chunk_status: Optional[str] = "idle"
 
 class BlackboxChunkUpload(BaseModel):
     upload_id: str
@@ -156,7 +161,7 @@ def to_time_label_from_seconds(seconds_float):
 def decode_j1939_id(raw_id):
     id_int = int(raw_id)
     priority = (id_int >> 26) & 0x7
-    dp = (id_int >> 24) & 0x1
+    dp = (idInt >> 24) & 0x1
     pf = (id_int >> 16) & 0xFF
     ps = (id_int >> 8) & 0xFF
     sa = id_int & 0xFF
@@ -398,7 +403,7 @@ def parse_known_j1939(frame):
         "id": can_id_hex,
         "message": f"Unknown PGN {pgn}",
         "sender": format_sender(meta["sa"]),
-        "receiver": format_receiver(meta),
+        "receiver": formatReceiver(meta),
         "dlc": frame.get("dlc", 8),
         "payload": payload_hex,
         "decoded": "Raw Data",
@@ -737,7 +742,12 @@ def register_truck(payload: TruckRegisterPayload):
             "lat": payload.lat,
             "lon": payload.lon,
             "updated_at": time.time(),
-            "mode": payload.mode or "sentinel"
+            "mode": payload.mode or "sentinel",
+            "priority_mode": payload.priority_mode or False,
+            "pending_blackbox_upload": payload.pending_blackbox_upload or False,
+            "blackbox_locked_until_upload": payload.blackbox_locked_until_upload or False,
+            "last_error": payload.last_error or "",
+            "chunk_status": payload.chunk_status or "idle"
         }
     }
 
@@ -761,7 +771,12 @@ def get_online_trucks():
             "lon": meta.get("lon", -49.2731),
             "updated_at": updated_at,
             "is_recent": (now - updated_at) <= 30.0,
-            "mode": meta.get("mode", "unknown")
+            "mode": meta.get("mode", "unknown"),
+            "priority_mode": meta.get("priority_mode", False),
+            "pending_blackbox_upload": meta.get("pending_blackbox_upload", False),
+            "blackbox_locked_until_upload": meta.get("blackbox_locked_until_upload", False),
+            "last_error": meta.get("last_error", ""),
+            "chunk_status": meta.get("chunk_status", "idle")
         })
 
     trucks.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
@@ -791,7 +806,12 @@ async def upload_live_signals(payload: LiveSignalsPayload):
         "lat": payload.lat,
         "lon": payload.lon,
         "updated_at": time.time(),
-        "mode": current_meta.get("mode", "online")
+        "mode": current_meta.get("mode", "online"),
+        "priority_mode": current_meta.get("priority_mode", False),
+        "pending_blackbox_upload": current_meta.get("pending_blackbox_upload", False),
+        "blackbox_locked_until_upload": current_meta.get("blackbox_locked_until_upload", False),
+        "last_error": current_meta.get("last_error", ""),
+        "chunk_status": current_meta.get("chunk_status", "idle")
     }
 
     return {"status": "success", "processed_frames": len(payload.frames)}
