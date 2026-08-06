@@ -58,6 +58,7 @@ class CanFrame(BaseModel):
     id: int
     dlc: int
     d: List[int]
+    extd: Optional[bool] = True
 
 class LiveSignalsPayload(BaseModel):
     truck_id: str
@@ -322,6 +323,21 @@ def decode_dm1(payload_bytes):
     }
 
 def parse_known_j1939(frame):
+    is_extended = frame.get("extd", True)
+    if not is_extended:
+        return {
+            "id": normalize_can_id(frame.get("id")),
+            "message": "Standard CAN Frame",
+            "sender": "N/A",
+            "receiver": "N/A",
+            "dlc": frame.get("dlc", 8),
+            "payload": payload_to_hex(frame.get("d", []) or []),
+            "decoded": "Unsupported non-J1939 standard frame",
+            "sigs": {},
+            "dtc": None,
+            "is_j1939": False
+        }
+
     can_id = frame.get("id")
     can_id_hex = normalize_can_id(can_id)
     payload_bytes = frame.get("d", []) or []
@@ -358,7 +374,8 @@ def parse_known_j1939(frame):
             "payload": payload_hex,
             "decoded": decoded["decoded"],
             "sigs": decoded.get("sigs", {}),
-            "dtc": decoded.get("dtc")
+            "dtc": decoded.get("dtc"),
+            "is_j1939": True
         }
 
     return {
@@ -370,7 +387,8 @@ def parse_known_j1939(frame):
         "payload": payload_hex,
         "decoded": "Raw Data",
         "sigs": {},
-        "dtc": None
+        "dtc": None,
+        "is_j1939": True
     }
 
 def build_workspace_log(raw_log):
@@ -381,6 +399,9 @@ def build_workspace_log(raw_log):
     ordered_ts = []
 
     for frame in raw_log:
+        if not frame.get("extd", True):
+            continue
+
         t = int(frame.get("t", 0))
         if t not in grouped:
             grouped[t] = []
@@ -398,6 +419,9 @@ def build_workspace_log(raw_log):
         for frame in grouped[t]:
             parsed = parse_known_j1939(frame)
 
+            if not parsed.get("is_j1939", False):
+                continue
+
             frames_out.append({
                 "id": parsed["id"],
                 "message": parsed["message"],
@@ -411,13 +435,14 @@ def build_workspace_log(raw_log):
             if parsed["sigs"]:
                 sigs.update(parsed["sigs"])
 
-        rel = (t - base_t) / 1000.0
-        workspace_log.append({
-            "time": to_time_label_from_seconds(rel),
-            "rel": rel,
-            "sigs": sigs,
-            "frames": frames_out
-        })
+        if frames_out:
+            rel = (t - base_t) / 1000.0
+            workspace_log.append({
+                "time": to_time_label_from_seconds(rel),
+                "rel": rel,
+                "sigs": sigs,
+                "frames": frames_out
+            })
 
     return workspace_log
 
