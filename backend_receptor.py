@@ -32,6 +32,8 @@ live_signals_db = {}
 LIVE_DATA_TIMEOUT_SECONDS = 5.0
 MAX_LIVE_FRAMES_PER_TRUCK = 2000
 
+pending_blackbox_chunks = {}
+
 class HeartbeatResponse(BaseModel):
     status: str
     user_is_monitoring: bool
@@ -71,6 +73,14 @@ class TruckRegisterPayload(BaseModel):
     lat: float | None = None
     lon: float | None = None
     mode: str | None = "sentinel"
+
+class BlackboxChunkUpload(BaseModel):
+    upload_id: str
+    chunk_index: int
+    chunk_total: int
+    metadata: BlackboxMetadata
+    frames: List[CanFrame]
+    log_format: Optional[str] = "raw_can"
 
 DTC_DICT = {
     "140_2": {"caption": "Engine Oil Pressure", "ftb": "Data Erratic, Intermittent Or Incorrect"},
@@ -610,6 +620,58 @@ def build_offline_package(log_id, metadata, raw_log, workspace_log):
         "raw_log": raw_log
     }
 
+def persist_blackbox_record(metadata_dict, raw_log, log_format="raw_can"):
+    log_id = f"log_caixa_preta_{str(uuid.uuid4())[:8]}"
+
+    workspace_log = build_workspace_log(raw_log)
+
+    event_summary = {
+        "name": f"{metadata_dict.get('truck_id')} ({metadata_dict.get('trigger_event')})",
+        "value": [metadata_dict.get("lon"), metadata_dict.get("lat"), 1],
+        "itemStyle": {"color": "#ef4444"},
+        "isAlert": True,
+        "logId": log_id,
+        "timestamp": metadata_dict.get("timestamp")
+    }
+
+    offline_package = build_offline_package(
+        log_id=log_id,
+        metadata=metadata_dict,
+        raw_log=raw_log,
+        workspace_log=workspace_log
+    )
+
+    record = {
+        "log_id": log_id,
+        "payload": {
+            "metadata": metadata_dict,
+            "raw_log": raw_log,
+            "workspace_log": workspace_log,
+            "log_format": log_format,
+            "offline_package": offline_package
+        },
+        "event_summary": event_summary
+    }
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO blackbox_logs (payload) VALUES (%s)",
+        (json.dumps(record),)
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return {
+        "status": "success",
+        "log_id": log_id,
+        "workspace_frames": len(workspace_log),
+        "raw_frames": len(raw_log),
+        "markers": len(offline_package["uiState"]["markers"]),
+        "message": "Caixa preta armazenada no Supabase."
+    }
+
 @app.post("/api/heartbeat")
 async def receive_heartbeat():
     SYSTEM_STATE["last_heartbeat_time"] = time.time()
@@ -666,12 +728,17 @@ def register_truck(payload: TruckRegisterPayload):
             "__meta__": {}
         }
 
-    live_signals_db[truck]["__meta__"] = {
-        "truck_id": payload.truck_id,
-        "lat": payload.lat,
-        "lon": payload.lon,
-        "updated_at": time.time(),
-        "mode": payload.mode or "sentinel"
+    current_frames = live_signals_db[truck].get("frames", [])
+
+    live_signals_db[truck] = {
+        "frames": current_frames,
+        "__meta__": {
+            "truck_id": payload.truck_id,
+            "lat": payload.lat,
+            "lon": payload.lon,
+            "updated_at": time.time(),
+            "mode": payload.mode or "sentinel"
+        }
     }
 
     return {
@@ -760,60 +827,61 @@ async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
 
 @app.post("/api/blackbox/upload")
 def upload_blackbox_log(payload: BlackboxUpload):
-    log_id = f"log_caixa_preta_{str(uuid.uuid4())[:8]}"
-
-    raw_log = payload.log
-    workspace_log = build_workspace_log(raw_log)
-
-    event_summary = {
-        "name": f"{payload.metadata.truck_id} ({payload.metadata.trigger_event})",
-        "value": [payload.metadata.lon, payload.metadata.lat, 1],
-        "itemStyle": {"color": "#ef4444"},
-        "isAlert": True,
-        "logId": log_id,
-        "timestamp": payload.metadata.timestamp
-    }
-
-    offline_package = build_offline_package(
-        log_id=log_id,
-        metadata=payload.metadata.dict(),
-        raw_log=raw_log,
-        workspace_log=workspace_log
-    )
-
-    record = {
-        "log_id": log_id,
-        "payload": {
-            "metadata": payload.metadata.dict(),
-            "raw_log": raw_log,
-            "workspace_log": workspace_log,
-            "log_format": payload.log_format or "raw_can",
-            "offline_package": offline_package
-        },
-        "event_summary": event_summary
-    }
-
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO blackbox_logs (payload) VALUES (%s)",
-            (json.dumps(record),)
+        return persist_blackbox_record(
+            metadata_dict=payload.metadata.dict(),
+            raw_log=payload.log,
+            log_format=payload.log_format or "raw_can"
         )
-        conn.commit()
-        cursor.close()
-        conn.close()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao salvar no Supabase: {str(e)}")
 
-    return {
-        "status": "success",
-        "log_id": log_id,
-        "workspace_frames": len(workspace_log),
-        "raw_frames": len(raw_log),
-        "markers": len(offline_package["uiState"]["markers"]),
-        "message": "Caixa preta armazenada no Supabase."
-    }
+@app.post("/api/blackbox/upload_chunk")
+def upload_blackbox_chunk(payload: BlackboxChunkUpload):
+    try:
+        upload_id = payload.upload_id
+
+        if upload_id not in pending_blackbox_chunks:
+            pending_blackbox_chunks[upload_id] = {
+                "metadata": payload.metadata.dict(),
+                "chunk_total": payload.chunk_total,
+                "received": {},
+                "created_at": time.time(),
+                "log_format": payload.log_format or "raw_can"
+            }
+
+        bucket = pending_blackbox_chunks[upload_id]
+        bucket["received"][payload.chunk_index] = [frame.dict() for frame in payload.frames]
+
+        received_count = len(bucket["received"])
+        if received_count < bucket["chunk_total"]:
+            return {
+                "status": "partial",
+                "upload_id": upload_id,
+                "received_chunks": received_count,
+                "chunk_total": bucket["chunk_total"]
+            }
+
+        full_log = []
+        for idx in range(bucket["chunk_total"]):
+            full_log.extend(bucket["received"].get(idx, []))
+
+        result = persist_blackbox_record(
+            metadata_dict=bucket["metadata"],
+            raw_log=full_log,
+            log_format=bucket["log_format"]
+        )
+
+        del pending_blackbox_chunks[upload_id]
+
+        return {
+            "status": "assembled",
+            "upload_id": upload_id,
+            **result
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao montar upload em chunks: {str(e)}")
 
 @app.get("/api/blackbox/events")
 def get_blackbox_events():
