@@ -24,7 +24,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 SYSTEM_STATE = {
     "last_heartbeat_time": 0.0,
     "user_is_monitoring": False,
-    "timeout_seconds": 30.0,
+    "timeout_seconds": 60.0,
     "monitoring_by_truck": {}
 }
 
@@ -119,7 +119,7 @@ def ensure_truck_state(truck_id: str):
         SYSTEM_STATE["monitoring_by_truck"][truck_id] = {
             "last_heartbeat_time": 0.0,
             "user_is_monitoring": False,
-            "timeout_seconds": 30.0
+            "timeout_seconds": 60.0
         }
     return SYSTEM_STATE["monitoring_by_truck"][truck_id]
 
