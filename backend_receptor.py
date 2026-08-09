@@ -1063,7 +1063,4 @@ def get_blackbox_direct(log_id: str):
         if not row:
             raise HTTPException(status_code=404, detail="Log não encontrado.")
 
-        return row]]></content>
-    </file>
-  </files>
-</file_context>
+        return row
