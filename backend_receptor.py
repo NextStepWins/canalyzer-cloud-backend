@@ -31,6 +31,7 @@ SYSTEM_STATE = {
 live_signals_db = {}
 LIVE_DATA_TIMEOUT_SECONDS = 5.0
 MAX_LIVE_FRAMES_PER_TRUCK = 2000
+BLACKBOX_EVENTS_LIGHT_LIMIT = 100
 
 pending_blackbox_chunks = {}
 PENDING_BLACKBOX_TTL_SECONDS = 900
@@ -80,6 +81,9 @@ class TruckRegisterPayload(BaseModel):
     last_error: Optional[str] = ""
     chunk_status: Optional[str] = "idle"
 
+class TruckStatePayload(BaseModel):
+    state: str
+
 class BlackboxChunkUpload(BaseModel):
     upload_id: str
     chunk_index: int
@@ -120,8 +124,11 @@ def ensure_truck_state(truck_id: str):
         SYSTEM_STATE["monitoring_by_truck"][truck_id] = {
             "last_heartbeat_time": 0.0,
             "user_is_monitoring": False,
-            "timeout_seconds": 30.0
+            "timeout_seconds": 30.0,
+            "desired_state": "sentinel"
         }
+    elif "desired_state" not in SYSTEM_STATE["monitoring_by_truck"][truck_id]:
+        SYSTEM_STATE["monitoring_by_truck"][truck_id]["desired_state"] = "sentinel"
     return SYSTEM_STATE["monitoring_by_truck"][truck_id]
 
 def cleanup_stale_pending_blackbox_chunks():
@@ -905,8 +912,6 @@ def upload_blackbox_log(payload: BlackboxUpload):
 @app.post("/api/blackbox/upload_chunk")
 def upload_blackbox_chunk(payload: BlackboxChunkUpload):
     try:
-        removed = cleanup_stale_pending_blackbox_chunks()
-
         upload_id = payload.upload_id
 
         if upload_id not in pending_blackbox_chunks:
@@ -932,8 +937,7 @@ def upload_blackbox_chunk(payload: BlackboxChunkUpload):
                 "status": "partial",
                 "upload_id": upload_id,
                 "received_chunks": received_count,
-                "chunk_total": expected_total,
-                "cleanup_removed": removed
+                "chunk_total": expected_total
             }
 
         missing_chunks = [idx for idx in range(expected_total) if idx not in bucket["received"]]
@@ -943,8 +947,7 @@ def upload_blackbox_chunk(payload: BlackboxChunkUpload):
                 "upload_id": upload_id,
                 "received_chunks": received_count,
                 "chunk_total": expected_total,
-                "missing_chunks": missing_chunks,
-                "cleanup_removed": removed
+                "missing_chunks": missing_chunks
             }
 
         full_log = []
@@ -962,34 +965,11 @@ def upload_blackbox_chunk(payload: BlackboxChunkUpload):
         return {
             "status": "success",
             "upload_id": upload_id,
-            "cleanup_removed": removed,
             **result
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao montar upload em chunks: {str(e)}")
-
-@app.post("/api/blackbox/cleanup_pending")
-def cleanup_pending_blackbox():
-    removed = cleanup_stale_pending_blackbox_chunks()
-    return {
-        "status": "success",
-        "removed_count": len(removed),
-        "removed": removed,
-        "pending_after_cleanup": len(pending_blackbox_chunks)
-    }
-
-@app.get("/api/blackbox/pending_status")
-def get_pending_blackbox_status():
-    removed = cleanup_stale_pending_blackbox_chunks()
-    summary = get_pending_blackbox_summary()
-    return {
-        "status": "success",
-        "ttl_seconds": PENDING_BLACKBOX_TTL_SECONDS,
-        "cleanup_removed_now": len(removed),
-        "pending_count": len(summary),
-        "pending_uploads": summary
-    }
 
 @app.get("/api/blackbox/events")
 def get_blackbox_events():
@@ -1109,8 +1089,7 @@ def get_blackbox_direct(log_id: str):
         if not row:
             raise HTTPException(status_code=404, detail="Log não encontrado.")
 
-        return row
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro na consulta direta: {str(e)}")
+        return row]]></content>
+    </file>
+  </files>
+</file_context>
