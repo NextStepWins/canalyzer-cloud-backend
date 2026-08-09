@@ -6,7 +6,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import List, Dict, Any, Optional
 
 app = FastAPI(title="CANalyzer Pro Backend - Híbrido (Streaming & EDR)")
@@ -61,6 +61,25 @@ class CanFrame(BaseModel):
     dlc: int
     d: List[int]
     extd: Optional[bool] = True
+
+    @field_validator("dlc")
+    @classmethod
+    def validate_dlc(cls, v):
+        if v < 0:
+            return 0
+        if v > 8:
+            return 8
+        return v
+
+    @field_validator("d")
+    @classmethod
+    def validate_data(cls, v):
+        if not isinstance(v, list):
+            return []
+        clean = []
+        for b in v[:8]:
+            clean.append(int(b) & 0xFF)
+        return clean
 
 
 class LiveSignalsPayload(BaseModel):
@@ -158,6 +177,30 @@ def ensure_support_tables():
 
 
 ensure_support_tables()
+
+
+def sanitize_frame_dict(frame: Dict[str, Any]) -> Dict[str, Any]:
+    dlc = int(frame.get("dlc", 0) or 0)
+    if dlc < 0:
+        dlc = 0
+    if dlc > 8:
+        dlc = 8
+
+    data = frame.get("d", []) or []
+    if not isinstance(data, list):
+        data = []
+
+    data = [int(x) & 0xFF for x in data[:8]]
+    if len(data) > dlc:
+        data = data[:dlc]
+
+    return {
+        "t": int(frame.get("t", 0) or 0),
+        "id": int(frame.get("id", 0) or 0),
+        "dlc": dlc,
+        "d": data,
+        "extd": bool(frame.get("extd", True))
+    }
 
 
 def ensure_truck_state(truck_id: str):
@@ -320,10 +363,14 @@ def normalize_can_id(raw_id):
     return "0x0"
 
 
-def payload_to_hex(data_bytes):
+def payload_to_hex(data_bytes, dlc=None):
     if not isinstance(data_bytes, list):
         return ""
-    return " ".join(f"{int(b) & 0xFF:02X}" for b in data_bytes)
+    payload = [int(b) & 0xFF for b in data_bytes[:8]]
+    if dlc is not None:
+        dlc = max(0, min(int(dlc), 8))
+        payload = payload[:dlc]
+    return " ".join(f"{b:02X}" for b in payload)
 
 
 def to_time_label_from_seconds(seconds_float):
@@ -535,6 +582,8 @@ def decode_dm1(payload_bytes):
 
 
 def parse_known_j1939(frame):
+    frame = sanitize_frame_dict(frame)
+
     is_extended = frame.get("extd", True)
     if not is_extended:
         return {
@@ -542,8 +591,8 @@ def parse_known_j1939(frame):
             "message": "Standard CAN Frame",
             "sender": "N/A",
             "receiver": "N/A",
-            "dlc": frame.get("dlc", 8),
-            "payload": payload_to_hex(frame.get("d", []) or []),
+            "dlc": frame.get("dlc", 0),
+            "payload": payload_to_hex(frame.get("d", []) or [], frame.get("dlc", 0)),
             "decoded": "Unsupported non-J1939 standard frame",
             "sigs": {},
             "dtc": None,
@@ -556,7 +605,8 @@ def parse_known_j1939(frame):
     can_id = frame.get("id")
     can_id_hex = normalize_can_id(can_id)
     payload_bytes = frame.get("d", []) or []
-    payload_hex = payload_to_hex(payload_bytes)
+    dlc = frame.get("dlc", len(payload_bytes))
+    payload_hex = payload_to_hex(payload_bytes, dlc)
 
     meta = decode_j1939_id(can_id)
     pgn = meta["pgn"]
@@ -585,7 +635,7 @@ def parse_known_j1939(frame):
             "message": decoded["message"],
             "sender": format_sender(meta["sa"]),
             "receiver": format_receiver(meta),
-            "dlc": frame.get("dlc", len(payload_bytes)),
+            "dlc": dlc,
             "payload": payload_hex,
             "decoded": decoded["decoded"],
             "sigs": decoded.get("sigs", {}),
@@ -601,7 +651,7 @@ def parse_known_j1939(frame):
         "message": f"Unknown PGN {pgn}",
         "sender": format_sender(meta["sa"]),
         "receiver": format_receiver(meta),
-        "dlc": frame.get("dlc", len(payload_bytes)),
+        "dlc": dlc,
         "payload": payload_hex,
         "decoded": "Raw Data",
         "sigs": {},
@@ -620,7 +670,8 @@ def build_workspace_log(raw_log):
     grouped = {}
     ordered_ts = []
 
-    for frame in raw_log:
+    for raw_frame in raw_log:
+        frame = sanitize_frame_dict(raw_frame)
         if not frame.get("extd", True):
             continue
 
@@ -829,14 +880,15 @@ def build_offline_package(log_id, metadata, raw_log, workspace_log):
         "dtcHistory": dtc_history,
         "globalSignalDict": {},
         "log": workspace_log,
-        "raw_log": raw_log
+        "raw_log": [sanitize_frame_dict(f) for f in raw_log]
     }
 
 
 def persist_blackbox_record(metadata_dict, raw_log, log_format="raw_can"):
     log_id = f"log_caixa_preta_{str(uuid.uuid4())[:8]}"
 
-    workspace_log = build_workspace_log(raw_log)
+    sanitized_raw_log = [sanitize_frame_dict(f) for f in raw_log]
+    workspace_log = build_workspace_log(sanitized_raw_log)
 
     event_summary = {
         "name": f"{metadata_dict.get('truck_id')} ({metadata_dict.get('trigger_event')})",
@@ -850,7 +902,7 @@ def persist_blackbox_record(metadata_dict, raw_log, log_format="raw_can"):
     offline_package = build_offline_package(
         log_id=log_id,
         metadata=metadata_dict,
-        raw_log=raw_log,
+        raw_log=sanitized_raw_log,
         workspace_log=workspace_log
     )
 
@@ -858,7 +910,7 @@ def persist_blackbox_record(metadata_dict, raw_log, log_format="raw_can"):
         "log_id": log_id,
         "payload": {
             "metadata": metadata_dict,
-            "raw_log": raw_log,
+            "raw_log": sanitized_raw_log,
             "workspace_log": workspace_log,
             "log_format": log_format,
             "offline_package": offline_package
@@ -880,7 +932,7 @@ def persist_blackbox_record(metadata_dict, raw_log, log_format="raw_can"):
         "status": "success",
         "log_id": log_id,
         "workspace_frames": len(workspace_log),
-        "raw_frames": len(raw_log),
+        "raw_frames": len(sanitized_raw_log),
         "markers": len(offline_package["uiState"]["markers"]),
         "message": "Caixa preta armazenada no Supabase."
     }
@@ -987,7 +1039,7 @@ async def upload_live_signals(payload: LiveSignalsPayload):
     truck_bucket = ensure_live_bucket(truck)
 
     for frame in payload.frames:
-        truck_bucket["frames"].append(frame.dict())
+        truck_bucket["frames"].append(sanitize_frame_dict(frame.dict()))
 
     if len(truck_bucket["frames"]) > MAX_LIVE_FRAMES_PER_TRUCK:
         truck_bucket["frames"] = truck_bucket["frames"][-MAX_LIVE_FRAMES_PER_TRUCK:]
@@ -1054,7 +1106,7 @@ async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
             "snapshot_unix_ms": stream.get("snapshot_unix_ms")
         }
 
-    frames_to_deliver = truck_data.get("frames", [])[:]
+    frames_to_deliver = [sanitize_frame_dict(f) for f in truck_data.get("frames", [])[:]]
     truck_data["frames"] = []
 
     return {
@@ -1075,7 +1127,7 @@ def upload_blackbox_log(payload: BlackboxUpload):
     try:
         return persist_blackbox_record(
             metadata_dict=payload.metadata.dict(),
-            raw_log=payload.log,
+            raw_log=[sanitize_frame_dict(f) for f in payload.log],
             log_format=payload.log_format or "raw_can"
         )
     except Exception as e:
@@ -1100,7 +1152,7 @@ def upload_blackbox_chunk(payload: BlackboxChunkUpload):
 
         bucket["metadata"] = payload.metadata.dict()
         bucket["chunk_total"] = payload.chunk_total
-        bucket["received"][str(payload.chunk_index)] = [frame.dict() for frame in payload.frames]
+        bucket["received"][str(payload.chunk_index)] = [sanitize_frame_dict(frame.dict()) for frame in payload.frames]
         bucket["log_format"] = payload.log_format or bucket.get("log_format", "raw_can")
 
         save_pending_chunk_bucket(upload_id, bucket)
@@ -1296,7 +1348,7 @@ def download_blackbox_offline(log_id: str):
             return offline_package
 
         metadata = payload.get("metadata", {})
-        raw_log = payload.get("raw_log", [])
+        raw_log = [sanitize_frame_dict(f) for f in payload.get("raw_log", [])]
         workspace_log = payload.get("workspace_log", build_workspace_log(raw_log))
 
         return build_offline_package(
