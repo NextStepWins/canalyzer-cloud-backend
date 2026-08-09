@@ -34,10 +34,12 @@ MAX_LIVE_FRAMES_PER_TRUCK = 2000
 BLACKBOX_EVENTS_LIGHT_LIMIT = 100
 PENDING_BLACKBOX_TTL_SECONDS = 900
 
+
 class HeartbeatTruckResponse(BaseModel):
     status: str
     user_is_monitoring: bool
     truck_id: str
+
 
 class BlackboxMetadata(BaseModel):
     truck_id: str
@@ -46,10 +48,12 @@ class BlackboxMetadata(BaseModel):
     lon: float
     timestamp: str
 
+
 class BlackboxUpload(BaseModel):
     metadata: BlackboxMetadata
     log: List[Dict[str, Any]]
     log_format: Optional[str] = "raw_can"
+
 
 class CanFrame(BaseModel):
     t: int
@@ -58,6 +62,7 @@ class CanFrame(BaseModel):
     d: List[int]
     extd: Optional[bool] = True
 
+
 class LiveSignalsPayload(BaseModel):
     truck_id: str
     frames: List[CanFrame]
@@ -65,6 +70,7 @@ class LiveSignalsPayload(BaseModel):
     lon: float | None = None
     snapshot_device_ms: Optional[int] = None
     snapshot_unix_ms: Optional[int] = None
+
 
 class TruckRegisterPayload(BaseModel):
     truck_id: str
@@ -77,8 +83,10 @@ class TruckRegisterPayload(BaseModel):
     last_error: Optional[str] = ""
     chunk_status: Optional[str] = "idle"
 
+
 class TruckStatePayload(BaseModel):
     state: str
+
 
 class BlackboxChunkUpload(BaseModel):
     upload_id: str
@@ -87,6 +95,7 @@ class BlackboxChunkUpload(BaseModel):
     metadata: BlackboxMetadata
     frames: List[CanFrame]
     log_format: Optional[str] = "raw_can"
+
 
 DTC_DICT = {
     "140_2": {"caption": "Engine Oil Pressure", "ftb": "Data Erratic, Intermittent Or Incorrect"},
@@ -98,22 +107,32 @@ DTC_DICT = {
     "158_4": {"caption": "Battery Potential / Power Input 1", "ftb": "Voltage Below Normal"}
 }
 
-J1939_SENDERS = {
+J1939_NODE_NAMES = {
     0x00: "Engine #1 (EMS)",
+    0x01: "Engine #2",
     0x03: "Transmission (TECU)",
+    0x05: "Shift Console",
     0x0B: "Brakes (EBS/ABS)",
-    0x11: "Vehicle Management",
+    0x0F: "Retarder",
+    0x11: "Cruise Control / Vehicle Management",
     0x17: "Instrument Cluster",
-    0x21: "Body Controller",
-    0x33: "Cab Controller",
+    0x19: "Climate Control",
+    0x21: "Body Controller / VMCU",
+    0x2B: "Brakes #2",
+    0x31: "Cab Controller",
+    0x33: "Driver Assistance (DACU)",
+    0xE8: "FMS Standard",
     0xEE: "Tachograph",
-    0xFF: "Broadcast"
+    0xF9: "Body Builder",
+    0xFF: "Global"
 }
+
 
 def get_db_connection():
     if not DATABASE_URL:
         raise HTTPException(status_code=500, detail="DATABASE_URL não configurada.")
     return psycopg2.connect(DATABASE_URL)
+
 
 def ensure_support_tables():
     conn = get_db_connection()
@@ -137,7 +156,9 @@ def ensure_support_tables():
     cursor.close()
     conn.close()
 
+
 ensure_support_tables()
+
 
 def ensure_truck_state(truck_id: str):
     if truck_id not in SYSTEM_STATE["monitoring_by_truck"]:
@@ -150,6 +171,7 @@ def ensure_truck_state(truck_id: str):
     elif "desired_state" not in SYSTEM_STATE["monitoring_by_truck"][truck_id]:
         SYSTEM_STATE["monitoring_by_truck"][truck_id]["desired_state"] = "sentinel"
     return SYSTEM_STATE["monitoring_by_truck"][truck_id]
+
 
 def ensure_live_bucket(truck_id: str):
     if truck_id not in live_signals_db:
@@ -177,6 +199,7 @@ def ensure_live_bucket(truck_id: str):
             live_signals_db[truck_id]["frames"] = []
 
     return live_signals_db[truck_id]
+
 
 def cleanup_stale_pending_blackbox_chunks():
     conn = get_db_connection()
@@ -208,6 +231,7 @@ def cleanup_stale_pending_blackbox_chunks():
     conn.close()
     return removed
 
+
 def get_pending_blackbox_summary():
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -237,6 +261,7 @@ def get_pending_blackbox_summary():
     summary.sort(key=lambda x: x["age_seconds"], reverse=True)
     return summary
 
+
 def load_pending_chunk_bucket(upload_id: str):
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -248,6 +273,7 @@ def load_pending_chunk_bucket(upload_id: str):
     cursor.close()
     conn.close()
     return (row["payload"] if row else None)
+
 
 def save_pending_chunk_bucket(upload_id: str, bucket: dict):
     conn = get_db_connection()
@@ -262,6 +288,7 @@ def save_pending_chunk_bucket(upload_id: str, bucket: dict):
     cursor.close()
     conn.close()
 
+
 def delete_pending_chunk_bucket(upload_id: str):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -270,12 +297,14 @@ def delete_pending_chunk_bucket(upload_id: str):
     cursor.close()
     conn.close()
 
+
 def get_dtc_text(spn, fmi):
     key = f"{spn}_{fmi}"
     return DTC_DICT.get(key, {
         "caption": f"SPN Não Catalogada ({spn})",
         "ftb": f"FMI Genérico ({fmi})"
     })
+
 
 def normalize_can_id(raw_id):
     if isinstance(raw_id, int):
@@ -290,10 +319,12 @@ def normalize_can_id(raw_id):
             return s
     return "0x0"
 
+
 def payload_to_hex(data_bytes):
     if not isinstance(data_bytes, list):
         return ""
     return " ".join(f"{int(b) & 0xFF:02X}" for b in data_bytes)
+
 
 def to_time_label_from_seconds(seconds_float):
     total_ms = int(round(max(seconds_float, 0) * 1000))
@@ -304,6 +335,7 @@ def to_time_label_from_seconds(seconds_float):
     ss = rem // 1000
     ms = rem % 1000
     return f"{hh:02d}:{mm:02d}:{ss:02d}.{ms:03d}"
+
 
 def decode_j1939_id(raw_id):
     id_int = int(raw_id)
@@ -335,18 +367,22 @@ def decode_j1939_id(raw_id):
         "is_pdu2": is_pdu2
     }
 
+
 def format_sender(sa):
-    return J1939_SENDERS.get(sa, f"SA 0x{sa:02X}")
+    return J1939_NODE_NAMES.get(sa, f"SA 0x{sa:02X}")
+
 
 def format_receiver(meta):
     if meta["is_pdu1"] and meta["da"] is not None:
-        return f"DA 0x{meta['da']:02X}"
+        return J1939_NODE_NAMES.get(meta["da"], f"DA 0x{meta['da']:02X}")
     return "Broadcast"
+
 
 def le_u16(data, start):
     if len(data) <= start + 1:
         return None
     return data[start] | (data[start + 1] << 8)
+
 
 def decode_eec1(payload_bytes):
     sigs = {}
@@ -370,6 +406,7 @@ def decode_eec1(payload_bytes):
 
     return {"message": "EEC1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
 
+
 def decode_eec2(payload_bytes):
     sigs = {}
     parts = []
@@ -380,6 +417,7 @@ def decode_eec2(payload_bytes):
         parts.append(f"AccelPedal1={accel:.2f} %")
 
     return {"message": "EEC2", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
+
 
 def decode_ccvs1(payload_bytes):
     sigs = {}
@@ -398,6 +436,7 @@ def decode_ccvs1(payload_bytes):
 
     return {"message": "CCVS1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
 
+
 def decode_ic1(payload_bytes):
     sigs = {}
     parts = []
@@ -409,6 +448,7 @@ def decode_ic1(payload_bytes):
 
     return {"message": "IC1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
 
+
 def decode_et1(payload_bytes):
     sigs = {}
     parts = []
@@ -419,6 +459,7 @@ def decode_et1(payload_bytes):
         parts.append(f"EngineCoolantTemp={coolant:.2f} °C")
 
     return {"message": "ET1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
+
 
 def decode_lfe1(payload_bytes):
     sigs = {}
@@ -438,6 +479,7 @@ def decode_lfe1(payload_bytes):
 
     return {"message": "LFE1", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
 
+
 def decode_vdhr(payload_bytes):
     sigs = {}
     parts = []
@@ -449,6 +491,7 @@ def decode_vdhr(payload_bytes):
         parts.append(f"Odometer={meters:.0f} m")
 
     return {"message": "VDHR", "decoded": " | ".join(parts) if parts else "Raw Data", "sigs": sigs}
+
 
 def decode_dm1(payload_bytes):
     if len(payload_bytes) < 4:
@@ -490,6 +533,7 @@ def decode_dm1(payload_bytes):
         }
     }
 
+
 def parse_known_j1939(frame):
     is_extended = frame.get("extd", True)
     if not is_extended:
@@ -503,7 +547,10 @@ def parse_known_j1939(frame):
             "decoded": "Unsupported non-J1939 standard frame",
             "sigs": {},
             "dtc": None,
-            "is_j1939": False
+            "is_j1939": False,
+            "pgn": None,
+            "sa": None,
+            "da": None
         }
 
     can_id = frame.get("id")
@@ -538,12 +585,15 @@ def parse_known_j1939(frame):
             "message": decoded["message"],
             "sender": format_sender(meta["sa"]),
             "receiver": format_receiver(meta),
-            "dlc": frame.get("dlc", 8),
+            "dlc": frame.get("dlc", len(payload_bytes)),
             "payload": payload_hex,
             "decoded": decoded["decoded"],
             "sigs": decoded.get("sigs", {}),
             "dtc": decoded.get("dtc"),
-            "is_j1939": True
+            "is_j1939": True,
+            "pgn": pgn,
+            "sa": meta["sa"],
+            "da": meta["da"]
         }
 
     return {
@@ -551,13 +601,17 @@ def parse_known_j1939(frame):
         "message": f"Unknown PGN {pgn}",
         "sender": format_sender(meta["sa"]),
         "receiver": format_receiver(meta),
-        "dlc": frame.get("dlc", 8),
+        "dlc": frame.get("dlc", len(payload_bytes)),
         "payload": payload_hex,
         "decoded": "Raw Data",
         "sigs": {},
         "dtc": None,
-        "is_j1939": True
+        "is_j1939": True,
+        "pgn": pgn,
+        "sa": meta["sa"],
+        "da": meta["da"]
     }
+
 
 def build_workspace_log(raw_log):
     if not isinstance(raw_log, list) or not raw_log:
@@ -597,7 +651,10 @@ def build_workspace_log(raw_log):
                 "receiver": parsed["receiver"],
                 "dlc": parsed["dlc"],
                 "payload": parsed["payload"],
-                "decoded": parsed["decoded"]
+                "decoded": parsed["decoded"],
+                "pgn": parsed.get("pgn"),
+                "sa": parsed.get("sa"),
+                "da": parsed.get("da")
             })
 
             if parsed["sigs"]:
@@ -613,6 +670,7 @@ def build_workspace_log(raw_log):
             })
 
     return workspace_log
+
 
 def build_markers_from_workspace_log(workspace_log):
     markers = []
@@ -665,6 +723,7 @@ def build_markers_from_workspace_log(workspace_log):
                 })
 
     return markers
+
 
 def build_dtc_history_from_workspace_log(workspace_log):
     dtc_history = {}
@@ -734,6 +793,7 @@ def build_dtc_history_from_workspace_log(workspace_log):
 
     return dtc_history
 
+
 def build_offline_package(log_id, metadata, raw_log, workspace_log):
     markers = build_markers_from_workspace_log(workspace_log)
     dtc_history = build_dtc_history_from_workspace_log(workspace_log)
@@ -771,6 +831,7 @@ def build_offline_package(log_id, metadata, raw_log, workspace_log):
         "log": workspace_log,
         "raw_log": raw_log
     }
+
 
 def persist_blackbox_record(metadata_dict, raw_log, log_format="raw_can"):
     log_id = f"log_caixa_preta_{str(uuid.uuid4())[:8]}"
@@ -824,6 +885,7 @@ def persist_blackbox_record(metadata_dict, raw_log, log_format="raw_can"):
         "message": "Caixa preta armazenada no Supabase."
     }
 
+
 @app.post("/api/truck-state/{truck_id}")
 def set_truck_state_endpoint(truck_id: str, payload: TruckStatePayload):
     truck_state = ensure_truck_state(truck_id)
@@ -846,6 +908,7 @@ def set_truck_state_endpoint(truck_id: str, payload: TruckStatePayload):
         "user_is_monitoring": truck_state["user_is_monitoring"]
     }
 
+
 @app.get("/api/status/{truck_id}")
 async def check_system_status_for_truck(truck_id: str) -> HeartbeatTruckResponse:
     truck_state = ensure_truck_state(truck_id)
@@ -857,6 +920,7 @@ async def check_system_status_for_truck(truck_id: str) -> HeartbeatTruckResponse
         user_is_monitoring=truck_state["user_is_monitoring"],
         truck_id=truck_id
     )
+
 
 @app.post("/api/trucks/register")
 def register_truck(payload: TruckRegisterPayload):
@@ -889,6 +953,7 @@ def register_truck(payload: TruckRegisterPayload):
         "truck_id": payload.truck_id
     }
 
+
 @app.get("/api/trucks/online")
 def get_online_trucks():
     now = time.time()
@@ -914,6 +979,7 @@ def get_online_trucks():
 
     trucks.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
     return {"trucks": trucks}
+
 
 @app.post("/signals")
 async def upload_live_signals(payload: LiveSignalsPayload):
@@ -950,6 +1016,7 @@ async def upload_live_signals(payload: LiveSignalsPayload):
         "processed_frames": len(payload.frames),
         "snapshot_seq": truck_bucket["__stream__"]["snapshot_seq"]
     }
+
 
 @app.get("/signals")
 async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
@@ -1002,6 +1069,7 @@ async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
         "snapshot_unix_ms": stream.get("snapshot_unix_ms")
     }
 
+
 @app.post("/api/blackbox/upload")
 def upload_blackbox_log(payload: BlackboxUpload):
     try:
@@ -1012,6 +1080,7 @@ def upload_blackbox_log(payload: BlackboxUpload):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao salvar no Supabase: {str(e)}")
+
 
 @app.post("/api/blackbox/upload_chunk")
 def upload_blackbox_chunk(payload: BlackboxChunkUpload):
@@ -1081,6 +1150,7 @@ def upload_blackbox_chunk(payload: BlackboxChunkUpload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao montar upload em chunks: {str(e)}")
 
+
 @app.post("/api/blackbox/cleanup_pending")
 def cleanup_pending_blackbox():
     removed = cleanup_stale_pending_blackbox_chunks()
@@ -1090,6 +1160,7 @@ def cleanup_pending_blackbox():
         "removed": removed,
         "pending_after_cleanup": len(get_pending_blackbox_summary())
     }
+
 
 @app.get("/api/blackbox/pending_status")
 def get_pending_blackbox_status():
@@ -1102,6 +1173,7 @@ def get_pending_blackbox_status():
         "pending_count": len(summary),
         "pending_uploads": summary
     }
+
 
 @app.get("/api/blackbox/events")
 def get_blackbox_events():
@@ -1132,6 +1204,7 @@ def get_blackbox_events():
         return {"events": events}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao buscar eventos: {str(e)}")
+
 
 @app.get("/api/blackbox/events/light")
 def get_blackbox_events_light():
@@ -1175,6 +1248,7 @@ def get_blackbox_events_light():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao buscar eventos leves: {str(e)}")
 
+
 @app.get("/api/blackbox/download/{log_id}")
 def download_blackbox_log(log_id: str):
     try:
@@ -1196,6 +1270,7 @@ def download_blackbox_log(log_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao baixar log: {str(e)}")
+
 
 @app.get("/api/blackbox/offline/{log_id}")
 def download_blackbox_offline(log_id: str):
@@ -1234,6 +1309,7 @@ def download_blackbox_offline(log_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao montar pacote offline: {str(e)}")
+
 
 @app.get("/api/blackbox/direct/{log_id}")
 def get_blackbox_direct(log_id: str):
