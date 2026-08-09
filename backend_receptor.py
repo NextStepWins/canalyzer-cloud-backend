@@ -76,10 +76,7 @@ class CanFrame(BaseModel):
     def validate_data(cls, v):
         if not isinstance(v, list):
             return []
-        clean = []
-        for b in v[:8]:
-            clean.append(int(b) & 0xFF)
-        return clean
+        return [int(b) & 0xFF for b in v[:8]]
 
 
 class LiveSignalsPayload(BaseModel):
@@ -181,10 +178,7 @@ ensure_support_tables()
 
 def sanitize_frame_dict(frame: Dict[str, Any]) -> Dict[str, Any]:
     dlc = int(frame.get("dlc", 0) or 0)
-    if dlc < 0:
-        dlc = 0
-    if dlc > 8:
-        dlc = 8
+    dlc = max(0, min(dlc, 8))
 
     data = frame.get("d", []) or []
     if not isinstance(data, list):
@@ -315,7 +309,7 @@ def load_pending_chunk_bucket(upload_id: str):
     row = cursor.fetchone()
     cursor.close()
     conn.close()
-    return (row["payload"] if row else None)
+    return row["payload"] if row else None
 
 
 def save_pending_chunk_bucket(upload_id: str, bucket: dict):
