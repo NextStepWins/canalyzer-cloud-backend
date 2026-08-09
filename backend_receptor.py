@@ -24,14 +24,13 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 SYSTEM_STATE = {
     "last_heartbeat_time": 0.0,
     "user_is_monitoring": False,
-    "timeout_seconds": 60.0,
+    "timeout_seconds": 30.0,
     "monitoring_by_truck": {}
 }
 
 live_signals_db = {}
 LIVE_DATA_TIMEOUT_SECONDS = 5.0
 MAX_LIVE_FRAMES_PER_TRUCK = 2000
-BLACKBOX_EVENTS_LIGHT_LIMIT = 100
 
 pending_blackbox_chunks = {}
 
@@ -80,6 +79,9 @@ class TruckRegisterPayload(BaseModel):
     last_error: Optional[str] = ""
     chunk_status: Optional[str] = "idle"
 
+class TruckStateUpdatePayload(BaseModel):
+    state: str
+
 class BlackboxChunkUpload(BaseModel):
     upload_id: str
     chunk_index: int
@@ -120,7 +122,7 @@ def ensure_truck_state(truck_id: str):
         SYSTEM_STATE["monitoring_by_truck"][truck_id] = {
             "last_heartbeat_time": 0.0,
             "user_is_monitoring": False,
-            "timeout_seconds": 60.0
+            "timeout_seconds": 30.0
         }
     return SYSTEM_STATE["monitoring_by_truck"][truck_id]
 
@@ -958,48 +960,6 @@ def get_blackbox_events():
         return {"events": events}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao buscar eventos: {str(e)}")
-
-@app.get("/api/blackbox/events/light")
-def get_blackbox_events_light():
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT payload FROM blackbox_logs ORDER BY created_at DESC LIMIT %s",
-            (BLACKBOX_EVENTS_LIGHT_LIMIT,)
-        )
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
-
-        events = []
-        for row in rows:
-            record = row[0] or {}
-            payload = record.get("payload", {}) or {}
-            metadata = payload.get("metadata", {}) or {}
-            event_summary = record.get("event_summary", {}) or {}
-
-            truck_id = metadata.get("truck_id") or event_summary.get("name") or "Volvo FH540 (Recuperado)"
-            timestamp = metadata.get("timestamp") or event_summary.get("timestamp") or "N/A"
-            trigger_event = metadata.get("trigger_event") or "Falha DM1 Detectada"
-            lat = metadata.get("lat", -25.4284)
-            lon = metadata.get("lon", -49.2731)
-
-            events.append({
-                "log_id": record.get("log_id") or event_summary.get("logId"),
-                "event_summary": event_summary,
-                "metadata": {
-                    "truck_id": truck_id,
-                    "timestamp": timestamp,
-                    "trigger_event": trigger_event,
-                    "lat": lat,
-                    "lon": lon
-                }
-            })
-
-        return {"events": events}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao buscar eventos leves: {str(e)}")
 
 @app.get("/api/blackbox/download/{log_id}")
 def download_blackbox_log(log_id: str):
