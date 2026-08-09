@@ -131,6 +131,29 @@ def ensure_truck_state(truck_id: str):
         SYSTEM_STATE["monitoring_by_truck"][truck_id]["desired_state"] = "sentinel"
     return SYSTEM_STATE["monitoring_by_truck"][truck_id]
 
+def ensure_live_bucket(truck_id: str):
+    if truck_id not in live_signals_db:
+        live_signals_db[truck_id] = {
+            "frames": [],
+            "__meta__": {},
+            "__stream__": {
+                "snapshot_seq": 0,
+                "last_server_time": 0.0
+            }
+        }
+    else:
+        if "__stream__" not in live_signals_db[truck_id]:
+            live_signals_db[truck_id]["__stream__"] = {
+                "snapshot_seq": 0,
+                "last_server_time": 0.0
+            }
+        if "__meta__" not in live_signals_db[truck_id]:
+            live_signals_db[truck_id]["__meta__"] = {}
+        if "frames" not in live_signals_db[truck_id]:
+            live_signals_db[truck_id]["frames"] = []
+
+    return live_signals_db[truck_id]
+
 def cleanup_stale_pending_blackbox_chunks():
     now = time.time()
     removed = []
@@ -746,7 +769,6 @@ def set_truck_state_endpoint(truck_id: str, payload: TruckStatePayload):
 async def check_system_status_for_truck(truck_id: str) -> HeartbeatTruckResponse:
     truck_state = ensure_truck_state(truck_id)
     desired_state = truck_state.get("desired_state", "sentinel")
-
     truck_state["user_is_monitoring"] = (desired_state == "online")
 
     return HeartbeatTruckResponse(
@@ -755,124 +777,19 @@ async def check_system_status_for_truck(truck_id: str) -> HeartbeatTruckResponse
         truck_id=truck_id
     )
 
-@app.post("/api/heartbeat")
-async def receive_heartbeat():
-    SYSTEM_STATE["last_heartbeat_time"] = time.time()
-    SYSTEM_STATE["user_is_monitoring"] = True
-    return {"status": "alive", "timestamp": SYSTEM_STATE["last_heartbeat_time"]}
-
-@app.get("/api/status")
-async def check_system_status() -> HeartbeatResponse:
-    current_time = time.time()
-    time_since_last_pulse = current_time - SYSTEM_STATE["last_heartbeat_time"]
-
-    if time_since_last_pulse > SYSTEM_STATE["timeout_seconds"]:
-        SYSTEM_STATE["user_is_monitoring"] = False
-
-    return HeartbeatResponse(
-        status="ok",
-        user_is_monitoring=SYSTEM_STATE["user_is_monitoring"]
-    )
-
-@app.post("/api/heartbeat/{truck_id}")
-async def receive_heartbeat_for_truck(truck_id: str):
-    truck_state = ensure_truck_state(truck_id)
-    truck_state["last_heartbeat_time"] = time.time()
-    truck_state["user_is_monitoring"] = True
-    truck_state["desired_state"] = "online"
-    return {
-        "status": "alive",
-        "truck_id": truck_id,
-        "timestamp": truck_state["last_heartbeat_time"]
-    }
-
-@app.post("/api/heartbeat/stop/{truck_id}")
-async def stop_heartbeat_for_truck(truck_id: str):
-    truck_state = ensure_truck_state(truck_id)
-    truck_state["last_heartbeat_time"] = 0.0
-    truck_state["user_is_monitoring"] = False
-    truck_state["desired_state"] = "sentinel"
-    return {
-        "status": "stopped",
-        "truck_id": truck_id
-    }
-
-@app.post("/api/trucks/register")
-def register_truck(payload: TruckRegisterPayload):
-    truck = payload.truck_id
-
-    if truck not in live_signals_db:
-        live_signals_db[truck] = {
-            "frames": [],
-            "__meta__": {}
-        }
-
-    current_frames = live_signals_db[truck].get("frames", [])
-
-    live_signals_db[truck] = {
-        "frames": current_frames,
-        "__meta__": {
-            "truck_id": payload.truck_id,
-            "lat": payload.lat,
-            "lon": payload.lon,
-            "updated_at": time.time(),
-            "mode": payload.mode or "sentinel",
-            "priority_mode": payload.priority_mode or False,
-            "pending_blackbox_upload": payload.pending_blackbox_upload or False,
-            "blackbox_locked_until_upload": payload.blackbox_locked_until_upload or False,
-            "last_error": payload.last_error or "",
-            "chunk_status": payload.chunk_status or "idle"
-        }
-    }
-
-    return {
-        "status": "registered",
-        "truck_id": payload.truck_id
-    }
-
-@app.get("/api/trucks/online")
-def get_online_trucks():
-    now = time.time()
-    trucks = []
-
-    for truck_id, truck_payload in live_signals_db.items():
-        meta = truck_payload.get("__meta__", {})
-        updated_at = meta.get("updated_at", 0.0)
-
-        trucks.append({
-            "truck_id": truck_id,
-            "lat": meta.get("lat", -25.4284),
-            "lon": meta.get("lon", -49.2731),
-            "updated_at": updated_at,
-            "is_recent": (now - updated_at) <= 30.0,
-            "mode": meta.get("mode", "unknown"),
-            "priority_mode": meta.get("priority_mode", False),
-            "pending_blackbox_upload": meta.get("pending_blackbox_upload", False),
-            "blackbox_locked_until_upload": meta.get("blackbox_locked_until_upload", False),
-            "last_error": meta.get("last_error", ""),
-            "chunk_status": meta.get("chunk_status", "idle")
-        })
-
-    trucks.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
-    return {"trucks": trucks}
-
 @app.post("/signals")
 async def upload_live_signals(payload: LiveSignalsPayload):
     truck = payload.truck_id
-
-    if truck not in live_signals_db:
-        live_signals_db[truck] = {
-            "frames": [],
-            "__meta__": {}
-        }
-
-    truck_bucket = live_signals_db[truck]
+    truck_bucket = ensure_live_bucket(truck)
 
     for frame in payload.frames:
         truck_bucket["frames"].append(frame.dict())
 
     if len(truck_bucket["frames"]) > MAX_LIVE_FRAMES_PER_TRUCK:
         truck_bucket["frames"] = truck_bucket["frames"][-MAX_LIVE_FRAMES_PER_TRUCK:]
+
+    truck_bucket["__stream__"]["snapshot_seq"] += 1
+    truck_bucket["__stream__"]["last_server_time"] = time.time()
 
     current_meta = truck_bucket.get("__meta__", {})
     truck_bucket["__meta__"] = {
@@ -888,16 +805,27 @@ async def upload_live_signals(payload: LiveSignalsPayload):
         "chunk_status": current_meta.get("chunk_status", "idle")
     }
 
-    return {"status": "success", "processed_frames": len(payload.frames)}
+    return {
+        "status": "success",
+        "processed_frames": len(payload.frames),
+        "snapshot_seq": truck_bucket["__stream__"]["snapshot_seq"]
+    }
 
 @app.get("/signals")
 async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
     if truck_id not in live_signals_db:
-        return {"status": "empty", "frames": [], "truck_id": truck_id}
+        return {
+            "status": "empty",
+            "frames": [],
+            "truck_id": truck_id,
+            "snapshot_seq": 0,
+            "server_time": time.time()
+        }
 
-    truck_data = live_signals_db[truck_id]
+    truck_data = ensure_live_bucket(truck_id)
     meta = truck_data.get("__meta__", {})
     updated_at = meta.get("updated_at", 0.0)
+    stream = truck_data.get("__stream__", {"snapshot_seq": 0, "last_server_time": 0.0})
 
     if (time.time() - updated_at) > LIVE_DATA_TIMEOUT_SECONDS:
         return {
@@ -905,7 +833,9 @@ async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
             "frames": [],
             "truck_id": truck_id,
             "lat": meta.get("lat", -25.4284),
-            "lon": meta.get("lon", -49.2731)
+            "lon": meta.get("lon", -49.2731),
+            "snapshot_seq": stream.get("snapshot_seq", 0),
+            "server_time": time.time()
         }
 
     frames_to_deliver = truck_data.get("frames", [])[:]
@@ -916,7 +846,9 @@ async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
         "frames": frames_to_deliver,
         "truck_id": meta.get("truck_id", truck_id),
         "lat": meta.get("lat", -25.4284),
-        "lon": meta.get("lon", -49.2731)
+        "lon": meta.get("lon", -49.2731),
+        "snapshot_seq": stream.get("snapshot_seq", 0),
+        "server_time": stream.get("last_server_time", time.time())
     }
 
 @app.post("/api/blackbox/upload")
