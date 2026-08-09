@@ -32,13 +32,7 @@ live_signals_db = {}
 LIVE_DATA_TIMEOUT_SECONDS = 5.0
 MAX_LIVE_FRAMES_PER_TRUCK = 2000
 BLACKBOX_EVENTS_LIGHT_LIMIT = 100
-
-pending_blackbox_chunks = {}
 PENDING_BLACKBOX_TTL_SECONDS = 900
-
-class HeartbeatResponse(BaseModel):
-    status: str
-    user_is_monitoring: bool
 
 class HeartbeatTruckResponse(BaseModel):
     status: str
@@ -69,6 +63,8 @@ class LiveSignalsPayload(BaseModel):
     frames: List[CanFrame]
     lat: float | None = None
     lon: float | None = None
+    snapshot_device_ms: Optional[int] = None
+    snapshot_unix_ms: Optional[int] = None
 
 class TruckRegisterPayload(BaseModel):
     truck_id: str
@@ -119,6 +115,30 @@ def get_db_connection():
         raise HTTPException(status_code=500, detail="DATABASE_URL não configurada.")
     return psycopg2.connect(DATABASE_URL)
 
+def ensure_support_tables():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS blackbox_logs (
+            id SERIAL PRIMARY KEY,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pending_blackbox_chunks (
+            upload_id TEXT PRIMARY KEY,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+ensure_support_tables()
+
 def ensure_truck_state(truck_id: str):
     if truck_id not in SYSTEM_STATE["monitoring_by_truck"]:
         SYSTEM_STATE["monitoring_by_truck"][truck_id] = {
@@ -138,14 +158,18 @@ def ensure_live_bucket(truck_id: str):
             "__meta__": {},
             "__stream__": {
                 "snapshot_seq": 0,
-                "last_server_time": 0.0
+                "last_server_time": 0.0,
+                "snapshot_device_ms": None,
+                "snapshot_unix_ms": None
             }
         }
     else:
         if "__stream__" not in live_signals_db[truck_id]:
             live_signals_db[truck_id]["__stream__"] = {
                 "snapshot_seq": 0,
-                "last_server_time": 0.0
+                "last_server_time": 0.0,
+                "snapshot_device_ms": None,
+                "snapshot_unix_ms": None
             }
         if "__meta__" not in live_signals_db[truck_id]:
             live_signals_db[truck_id]["__meta__"] = {}
@@ -155,39 +179,96 @@ def ensure_live_bucket(truck_id: str):
     return live_signals_db[truck_id]
 
 def cleanup_stale_pending_blackbox_chunks():
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("""
+        SELECT upload_id, payload, created_at
+        FROM pending_blackbox_chunks
+    """)
+    rows = cursor.fetchall()
+
     now = time.time()
     removed = []
 
-    for upload_id, bucket in list(pending_blackbox_chunks.items()):
-        created_at = bucket.get("created_at", 0.0)
+    for row in rows:
+        created_at = row["created_at"].timestamp() if row["created_at"] else 0.0
         if (now - created_at) > PENDING_BLACKBOX_TTL_SECONDS:
+            payload = row["payload"] or {}
             removed.append({
-                "upload_id": upload_id,
+                "upload_id": row["upload_id"],
                 "age_seconds": round(now - created_at, 2),
-                "received_chunks": len(bucket.get("received", {})),
-                "chunk_total": bucket.get("chunk_total", 0),
-                "truck_id": (bucket.get("metadata", {}) or {}).get("truck_id", "unknown")
+                "received_chunks": len((payload.get("received", {}) or {})),
+                "chunk_total": payload.get("chunk_total", 0),
+                "truck_id": ((payload.get("metadata", {}) or {}).get("truck_id", "unknown"))
             })
-            del pending_blackbox_chunks[upload_id]
+            cursor.execute("DELETE FROM pending_blackbox_chunks WHERE upload_id = %s", (row["upload_id"],))
 
+    conn.commit()
+    cursor.close()
+    conn.close()
     return removed
 
 def get_pending_blackbox_summary():
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("""
+        SELECT upload_id, payload, created_at
+        FROM pending_blackbox_chunks
+        ORDER BY updated_at DESC
+    """)
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
     now = time.time()
     summary = []
 
-    for upload_id, bucket in pending_blackbox_chunks.items():
-        created_at = bucket.get("created_at", 0.0)
+    for row in rows:
+        payload = row["payload"] or {}
+        created_at = row["created_at"].timestamp() if row["created_at"] else 0.0
         summary.append({
-            "upload_id": upload_id,
+            "upload_id": row["upload_id"],
             "age_seconds": round(now - created_at, 2),
-            "received_chunks": len(bucket.get("received", {})),
-            "chunk_total": bucket.get("chunk_total", 0),
-            "truck_id": (bucket.get("metadata", {}) or {}).get("truck_id", "unknown")
+            "received_chunks": len((payload.get("received", {}) or {})),
+            "chunk_total": payload.get("chunk_total", 0),
+            "truck_id": ((payload.get("metadata", {}) or {}).get("truck_id", "unknown"))
         })
 
     summary.sort(key=lambda x: x["age_seconds"], reverse=True)
     return summary
+
+def load_pending_chunk_bucket(upload_id: str):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute(
+        "SELECT payload FROM pending_blackbox_chunks WHERE upload_id = %s LIMIT 1",
+        (upload_id,)
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return (row["payload"] if row else None)
+
+def save_pending_chunk_bucket(upload_id: str, bucket: dict):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO pending_blackbox_chunks (upload_id, payload, created_at, updated_at)
+        VALUES (%s, %s, NOW(), NOW())
+        ON CONFLICT (upload_id)
+        DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+    """, (upload_id, json.dumps(bucket)))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def delete_pending_chunk_bucket(upload_id: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM pending_blackbox_chunks WHERE upload_id = %s", (upload_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 def get_dtc_text(spn, fmi):
     key = f"{spn}_{fmi}"
@@ -783,7 +864,9 @@ def register_truck(payload: TruckRegisterPayload):
 
     current_stream = truck_bucket.get("__stream__", {
         "snapshot_seq": 0,
-        "last_server_time": 0.0
+        "last_server_time": 0.0,
+        "snapshot_device_ms": None,
+        "snapshot_unix_ms": None
     })
 
     truck_bucket["__meta__"] = {
@@ -845,6 +928,8 @@ async def upload_live_signals(payload: LiveSignalsPayload):
 
     truck_bucket["__stream__"]["snapshot_seq"] += 1
     truck_bucket["__stream__"]["last_server_time"] = time.time()
+    truck_bucket["__stream__"]["snapshot_device_ms"] = payload.snapshot_device_ms
+    truck_bucket["__stream__"]["snapshot_unix_ms"] = payload.snapshot_unix_ms
 
     current_meta = truck_bucket.get("__meta__", {})
     truck_bucket["__meta__"] = {
@@ -874,13 +959,20 @@ async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
             "frames": [],
             "truck_id": truck_id,
             "snapshot_seq": 0,
-            "server_time": time.time()
+            "server_time": time.time(),
+            "snapshot_device_ms": None,
+            "snapshot_unix_ms": None
         }
 
     truck_data = ensure_live_bucket(truck_id)
     meta = truck_data.get("__meta__", {})
     updated_at = meta.get("updated_at", 0.0)
-    stream = truck_data.get("__stream__", {"snapshot_seq": 0, "last_server_time": 0.0})
+    stream = truck_data.get("__stream__", {
+        "snapshot_seq": 0,
+        "last_server_time": 0.0,
+        "snapshot_device_ms": None,
+        "snapshot_unix_ms": None
+    })
 
     if (time.time() - updated_at) > LIVE_DATA_TIMEOUT_SECONDS:
         return {
@@ -890,7 +982,9 @@ async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
             "lat": meta.get("lat", -25.4284),
             "lon": meta.get("lon", -49.2731),
             "snapshot_seq": stream.get("snapshot_seq", 0),
-            "server_time": time.time()
+            "server_time": time.time(),
+            "snapshot_device_ms": stream.get("snapshot_device_ms"),
+            "snapshot_unix_ms": stream.get("snapshot_unix_ms")
         }
 
     frames_to_deliver = truck_data.get("frames", [])[:]
@@ -903,7 +997,9 @@ async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
         "lat": meta.get("lat", -25.4284),
         "lon": meta.get("lon", -49.2731),
         "snapshot_seq": stream.get("snapshot_seq", 0),
-        "server_time": stream.get("last_server_time", time.time())
+        "server_time": stream.get("last_server_time", time.time()),
+        "snapshot_device_ms": stream.get("snapshot_device_ms"),
+        "snapshot_unix_ms": stream.get("snapshot_unix_ms")
     }
 
 @app.post("/api/blackbox/upload")
@@ -921,23 +1017,24 @@ def upload_blackbox_log(payload: BlackboxUpload):
 def upload_blackbox_chunk(payload: BlackboxChunkUpload):
     try:
         removed = cleanup_stale_pending_blackbox_chunks()
-
         upload_id = payload.upload_id
 
-        if upload_id not in pending_blackbox_chunks:
-            pending_blackbox_chunks[upload_id] = {
+        bucket = load_pending_chunk_bucket(upload_id)
+        if not bucket:
+            bucket = {
                 "metadata": payload.metadata.dict(),
                 "chunk_total": payload.chunk_total,
                 "received": {},
-                "created_at": time.time(),
+                "created_at_epoch": time.time(),
                 "log_format": payload.log_format or "raw_can"
             }
 
-        bucket = pending_blackbox_chunks[upload_id]
-
         bucket["metadata"] = payload.metadata.dict()
         bucket["chunk_total"] = payload.chunk_total
-        bucket["received"][payload.chunk_index] = [frame.dict() for frame in payload.frames]
+        bucket["received"][str(payload.chunk_index)] = [frame.dict() for frame in payload.frames]
+        bucket["log_format"] = payload.log_format or bucket.get("log_format", "raw_can")
+
+        save_pending_chunk_bucket(upload_id, bucket)
 
         received_count = len(bucket["received"])
         expected_total = bucket["chunk_total"]
@@ -951,7 +1048,7 @@ def upload_blackbox_chunk(payload: BlackboxChunkUpload):
                 "cleanup_removed": removed
             }
 
-        missing_chunks = [idx for idx in range(expected_total) if idx not in bucket["received"]]
+        missing_chunks = [idx for idx in range(expected_total) if str(idx) not in bucket["received"]]
         if missing_chunks:
             return {
                 "status": "partial_missing",
@@ -964,7 +1061,7 @@ def upload_blackbox_chunk(payload: BlackboxChunkUpload):
 
         full_log = []
         for idx in range(expected_total):
-            full_log.extend(bucket["received"][idx])
+            full_log.extend(bucket["received"][str(idx)])
 
         result = persist_blackbox_record(
             metadata_dict=bucket["metadata"],
@@ -972,7 +1069,7 @@ def upload_blackbox_chunk(payload: BlackboxChunkUpload):
             log_format=bucket["log_format"]
         )
 
-        del pending_blackbox_chunks[upload_id]
+        delete_pending_chunk_bucket(upload_id)
 
         return {
             "status": "success",
@@ -991,7 +1088,7 @@ def cleanup_pending_blackbox():
         "status": "success",
         "removed_count": len(removed),
         "removed": removed,
-        "pending_after_cleanup": len(pending_blackbox_chunks)
+        "pending_after_cleanup": len(get_pending_blackbox_summary())
     }
 
 @app.get("/api/blackbox/pending_status")
