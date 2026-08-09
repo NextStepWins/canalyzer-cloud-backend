@@ -720,6 +720,41 @@ def persist_blackbox_record(metadata_dict, raw_log, log_format="raw_can"):
         "message": "Caixa preta armazenada no Supabase."
     }
 
+@app.post("/api/truck-state/{truck_id}")
+def set_truck_state_endpoint(truck_id: str, payload: TruckStatePayload):
+    truck_state = ensure_truck_state(truck_id)
+    desired_state = (payload.state or "").strip().lower()
+
+    if desired_state not in {"online", "sentinel"}:
+        raise HTTPException(status_code=400, detail="Estado inválido. Use 'online' ou 'sentinel'.")
+
+    truck_state["desired_state"] = desired_state
+    truck_state["user_is_monitoring"] = (desired_state == "online")
+    if desired_state == "online":
+        truck_state["last_heartbeat_time"] = time.time()
+    else:
+        truck_state["last_heartbeat_time"] = 0.0
+
+    return {
+        "status": "success",
+        "truck_id": truck_id,
+        "desired_state": desired_state,
+        "user_is_monitoring": truck_state["user_is_monitoring"]
+    }
+
+@app.get("/api/status/{truck_id}")
+async def check_system_status_for_truck(truck_id: str) -> HeartbeatTruckResponse:
+    truck_state = ensure_truck_state(truck_id)
+    desired_state = truck_state.get("desired_state", "sentinel")
+
+    truck_state["user_is_monitoring"] = (desired_state == "online")
+
+    return HeartbeatTruckResponse(
+        status="ok",
+        user_is_monitoring=truck_state["user_is_monitoring"],
+        truck_id=truck_id
+    )
+
 @app.post("/api/heartbeat")
 async def receive_heartbeat():
     SYSTEM_STATE["last_heartbeat_time"] = time.time()
@@ -744,6 +779,7 @@ async def receive_heartbeat_for_truck(truck_id: str):
     truck_state = ensure_truck_state(truck_id)
     truck_state["last_heartbeat_time"] = time.time()
     truck_state["user_is_monitoring"] = True
+    truck_state["desired_state"] = "online"
     return {
         "status": "alive",
         "truck_id": truck_id,
@@ -755,26 +791,11 @@ async def stop_heartbeat_for_truck(truck_id: str):
     truck_state = ensure_truck_state(truck_id)
     truck_state["last_heartbeat_time"] = 0.0
     truck_state["user_is_monitoring"] = False
+    truck_state["desired_state"] = "sentinel"
     return {
         "status": "stopped",
         "truck_id": truck_id
     }
-
-@app.get("/api/status/{truck_id}")
-async def check_system_status_for_truck(truck_id: str) -> HeartbeatTruckResponse:
-    truck_state = ensure_truck_state(truck_id)
-
-    current_time = time.time()
-    time_since_last_pulse = current_time - truck_state["last_heartbeat_time"]
-
-    if time_since_last_pulse > truck_state["timeout_seconds"]:
-        truck_state["user_is_monitoring"] = False
-
-    return HeartbeatTruckResponse(
-        status="ok",
-        user_is_monitoring=truck_state["user_is_monitoring"],
-        truck_id=truck_id
-    )
 
 @app.post("/api/trucks/register")
 def register_truck(payload: TruckRegisterPayload):
@@ -912,6 +933,8 @@ def upload_blackbox_log(payload: BlackboxUpload):
 @app.post("/api/blackbox/upload_chunk")
 def upload_blackbox_chunk(payload: BlackboxChunkUpload):
     try:
+        removed = cleanup_stale_pending_blackbox_chunks()
+
         upload_id = payload.upload_id
 
         if upload_id not in pending_blackbox_chunks:
@@ -937,7 +960,8 @@ def upload_blackbox_chunk(payload: BlackboxChunkUpload):
                 "status": "partial",
                 "upload_id": upload_id,
                 "received_chunks": received_count,
-                "chunk_total": expected_total
+                "chunk_total": expected_total,
+                "cleanup_removed": removed
             }
 
         missing_chunks = [idx for idx in range(expected_total) if idx not in bucket["received"]]
@@ -947,7 +971,8 @@ def upload_blackbox_chunk(payload: BlackboxChunkUpload):
                 "upload_id": upload_id,
                 "received_chunks": received_count,
                 "chunk_total": expected_total,
-                "missing_chunks": missing_chunks
+                "missing_chunks": missing_chunks,
+                "cleanup_removed": removed
             }
 
         full_log = []
@@ -965,11 +990,34 @@ def upload_blackbox_chunk(payload: BlackboxChunkUpload):
         return {
             "status": "success",
             "upload_id": upload_id,
+            "cleanup_removed": removed,
             **result
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao montar upload em chunks: {str(e)}")
+
+@app.post("/api/blackbox/cleanup_pending")
+def cleanup_pending_blackbox():
+    removed = cleanup_stale_pending_blackbox_chunks()
+    return {
+        "status": "success",
+        "removed_count": len(removed),
+        "removed": removed,
+        "pending_after_cleanup": len(pending_blackbox_chunks)
+    }
+
+@app.get("/api/blackbox/pending_status")
+def get_pending_blackbox_status():
+    removed = cleanup_stale_pending_blackbox_chunks()
+    summary = get_pending_blackbox_summary()
+    return {
+        "status": "success",
+        "ttl_seconds": PENDING_BLACKBOX_TTL_SECONDS,
+        "cleanup_removed_now": len(removed),
+        "pending_count": len(summary),
+        "pending_uploads": summary
+    }
 
 @app.get("/api/blackbox/events")
 def get_blackbox_events():
@@ -1000,6 +1048,48 @@ def get_blackbox_events():
         return {"events": events}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao buscar eventos: {str(e)}")
+
+@app.get("/api/blackbox/events/light")
+def get_blackbox_events_light():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT payload FROM blackbox_logs ORDER BY created_at DESC LIMIT %s",
+            (BLACKBOX_EVENTS_LIGHT_LIMIT,)
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        events = []
+        for row in rows:
+            record = row[0] or {}
+            payload = record.get("payload", {}) or {}
+            metadata = payload.get("metadata", {}) or {}
+            event_summary = record.get("event_summary", {}) or {}
+
+            truck_id = metadata.get("truck_id") or event_summary.get("name") or "Volvo FH540 (Recuperado)"
+            timestamp = metadata.get("timestamp") or event_summary.get("timestamp") or "N/A"
+            trigger_event = metadata.get("trigger_event") or "Falha DM1 Detectada"
+            lat = metadata.get("lat", -25.4284)
+            lon = metadata.get("lon", -49.2731)
+
+            events.append({
+                "log_id": record.get("log_id") or event_summary.get("logId"),
+                "event_summary": event_summary,
+                "metadata": {
+                    "truck_id": truck_id,
+                    "timestamp": timestamp,
+                    "trigger_event": trigger_event,
+                    "lat": lat,
+                    "lon": lon
+                }
+            })
+
+        return {"events": events}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar eventos leves: {str(e)}")
 
 @app.get("/api/blackbox/download/{log_id}")
 def download_blackbox_log(log_id: str):
@@ -1089,7 +1179,8 @@ def get_blackbox_direct(log_id: str):
         if not row:
             raise HTTPException(status_code=404, detail="Log não encontrado.")
 
-        return row]]></content>
-    </file>
-  </files>
-</file_context>
+        return row
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro na consulta direta: {str(e)}")
