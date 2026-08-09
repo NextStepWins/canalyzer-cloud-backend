@@ -33,6 +33,7 @@ LIVE_DATA_TIMEOUT_SECONDS = 5.0
 MAX_LIVE_FRAMES_PER_TRUCK = 2000
 
 pending_blackbox_chunks = {}
+PENDING_BLACKBOX_TTL_SECONDS = 900
 
 class HeartbeatResponse(BaseModel):
     status: str
@@ -79,9 +80,6 @@ class TruckRegisterPayload(BaseModel):
     last_error: Optional[str] = ""
     chunk_status: Optional[str] = "idle"
 
-class TruckStateUpdatePayload(BaseModel):
-    state: str
-
 class BlackboxChunkUpload(BaseModel):
     upload_id: str
     chunk_index: int
@@ -125,6 +123,22 @@ def ensure_truck_state(truck_id: str):
             "timeout_seconds": 30.0
         }
     return SYSTEM_STATE["monitoring_by_truck"][truck_id]
+
+def cleanup_stale_pending_blackbox_chunks():
+    now = time.time()
+    removed = []
+    for upload_id, bucket in list(pending_blackbox_chunks.items()):
+        created_at = bucket.get("created_at", 0.0)
+        if (now - created_at) > PENDING_BLACKBOX_TTL_SECONDS:
+            removed.append({
+                "upload_id": upload_id,
+                "age_seconds": round(now - created_at, 2),
+                "received_chunks": len(bucket.get("received", {})),
+                "chunk_total": bucket.get("chunk_total", 0),
+                "truck_id": (bucket.get("metadata", {}) or {}).get("truck_id", "unknown")
+            })
+            del pending_blackbox_chunks[upload_id]
+    return removed
 
 def get_dtc_text(spn, fmi):
     key = f"{spn}_{fmi}"
@@ -1049,8 +1063,7 @@ def get_blackbox_direct(log_id: str):
         if not row:
             raise HTTPException(status_code=404, detail="Log não encontrado.")
 
-        return row
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro na consulta direta: {str(e)}")
+        return row]]></content>
+    </file>
+  </files>
+</file_context>
