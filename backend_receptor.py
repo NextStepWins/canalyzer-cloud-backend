@@ -777,6 +777,61 @@ async def check_system_status_for_truck(truck_id: str) -> HeartbeatTruckResponse
         truck_id=truck_id
     )
 
+@app.post("/api/trucks/register")
+def register_truck(payload: TruckRegisterPayload):
+    truck_bucket = ensure_live_bucket(payload.truck_id)
+
+    current_stream = truck_bucket.get("__stream__", {
+        "snapshot_seq": 0,
+        "last_server_time": 0.0
+    })
+
+    truck_bucket["__meta__"] = {
+        "truck_id": payload.truck_id,
+        "lat": payload.lat,
+        "lon": payload.lon,
+        "updated_at": time.time(),
+        "mode": payload.mode or "sentinel",
+        "priority_mode": payload.priority_mode or False,
+        "pending_blackbox_upload": payload.pending_blackbox_upload or False,
+        "blackbox_locked_until_upload": payload.blackbox_locked_until_upload or False,
+        "last_error": payload.last_error or "",
+        "chunk_status": payload.chunk_status or "idle"
+    }
+
+    truck_bucket["__stream__"] = current_stream
+
+    return {
+        "status": "registered",
+        "truck_id": payload.truck_id
+    }
+
+@app.get("/api/trucks/online")
+def get_online_trucks():
+    now = time.time()
+    trucks = []
+
+    for truck_id, truck_payload in live_signals_db.items():
+        meta = truck_payload.get("__meta__", {})
+        updated_at = meta.get("updated_at", 0.0)
+
+        trucks.append({
+            "truck_id": truck_id,
+            "lat": meta.get("lat", -25.4284),
+            "lon": meta.get("lon", -49.2731),
+            "updated_at": updated_at,
+            "is_recent": (now - updated_at) <= 30.0,
+            "mode": meta.get("mode", "unknown"),
+            "priority_mode": meta.get("priority_mode", False),
+            "pending_blackbox_upload": meta.get("pending_blackbox_upload", False),
+            "blackbox_locked_until_upload": meta.get("blackbox_locked_until_upload", False),
+            "last_error": meta.get("last_error", ""),
+            "chunk_status": meta.get("chunk_status", "idle")
+        })
+
+    trucks.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
+    return {"trucks": trucks}
+
 @app.post("/signals")
 async def upload_live_signals(payload: LiveSignalsPayload):
     truck = payload.truck_id
