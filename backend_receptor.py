@@ -218,6 +218,11 @@ def ensure_live_bucket(truck_id: str):
             "__stream__": {
                 "snapshot_seq": 0,
                 "last_server_time": 0.0,
+
+                # Timestamp exclusivo para confirmar que o backend
+                # recebeu um snapshot CAN em POST /signals.
+                "last_snapshot_received_at": 0.0,
+
                 "snapshot_device_ms": None,
                 "snapshot_unix_ms": None
             }
@@ -227,13 +232,26 @@ def ensure_live_bucket(truck_id: str):
             live_signals_db[truck_id]["__stream__"] = {
                 "snapshot_seq": 0,
                 "last_server_time": 0.0,
+                "last_snapshot_received_at": 0.0,
                 "snapshot_device_ms": None,
                 "snapshot_unix_ms": None
             }
+
         if "__meta__" not in live_signals_db[truck_id]:
             live_signals_db[truck_id]["__meta__"] = {}
+
         if "frames" not in live_signals_db[truck_id]:
             live_signals_db[truck_id]["frames"] = []
+
+        # Compatibilidade com buckets criados antes deste patch.
+        # Evita KeyError enquanto o backend estiver em execução.
+        if (
+            "last_snapshot_received_at"
+            not in live_signals_db[truck_id]["__stream__"]
+        ):
+            live_signals_db[truck_id]["__stream__"][
+                "last_snapshot_received_at"
+            ] = 0.0
 
     return live_signals_db[truck_id]
 
@@ -1001,31 +1019,88 @@ def register_truck(payload: TruckRegisterPayload):
 
 
 @app.get("/api/trucks/online")
+
+@app.get("/api/trucks/online")
 def get_online_trucks():
     now = time.time()
     trucks = []
 
     for truck_id, truck_payload in live_signals_db.items():
         meta = truck_payload.get("__meta__", {})
-        updated_at = meta.get("updated_at", 0.0)
+        stream = truck_payload.get("__stream__", {})
+
+        updated_at = float(meta.get("updated_at", 0.0) or 0.0)
+
+        last_snapshot_received_at = float(
+            stream.get("last_snapshot_received_at", 0.0) or 0.0
+        )
+
+        snapshot_seq = int(
+            stream.get("snapshot_seq", 0) or 0
+        )
+
+        if last_snapshot_received_at > 0:
+            snapshot_age_seconds = round(
+                max(0.0, now - last_snapshot_received_at),
+                2
+            )
+        else:
+            snapshot_age_seconds = None
+
+        # Regra oficial solicitada:
+        # conectado somente se recebeu snapshot nos últimos 5 segundos.
+        can_stream_connected = (
+            last_snapshot_received_at > 0
+            and snapshot_age_seconds is not None
+            and snapshot_age_seconds <= 5.0
+        )
 
         trucks.append({
             "truck_id": truck_id,
             "lat": meta.get("lat", -25.4284),
             "lon": meta.get("lon", -49.2731),
+
+            # Mantém o campo existente para não quebrar o frontend.
             "updated_at": updated_at,
+
+            # Mantém o comportamento atual de presença recente.
             "is_recent": (now - updated_at) <= 30.0,
+
             "mode": meta.get("mode", "unknown"),
-            "priority_mode": meta.get("priority_mode", False),
-            "pending_blackbox_upload": meta.get("pending_blackbox_upload", False),
-            "blackbox_locked_until_upload": meta.get("blackbox_locked_until_upload", False),
+            "priority_mode": meta.get(
+                "priority_mode",
+                False
+            ),
+            "pending_blackbox_upload": meta.get(
+                "pending_blackbox_upload",
+                False
+            ),
+            "blackbox_locked_until_upload": meta.get(
+                "blackbox_locked_until_upload",
+                False
+            ),
             "last_error": meta.get("last_error", ""),
-            "chunk_status": meta.get("chunk_status", "idle")
+            "chunk_status": meta.get("chunk_status", "idle"),
+
+            # Novos campos para status real de conectividade CAN.
+            "snapshot_seq": snapshot_seq,
+            "last_snapshot_received_at": (
+                last_snapshot_received_at
+                if last_snapshot_received_at > 0
+                else None
+            ),
+            "snapshot_age_seconds": snapshot_age_seconds,
+            "can_stream_connected": can_stream_connected
         })
 
-    trucks.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
-    return {"trucks": trucks}
+    trucks.sort(
+        key=lambda truck: truck.get("updated_at", 0),
+        reverse=True
+    )
 
+    return {
+        "trucks": trucks
+    }
 
 @app.post("/signals")
 async def upload_live_signals(payload: LiveSignalsPayload):
@@ -1033,26 +1108,52 @@ async def upload_live_signals(payload: LiveSignalsPayload):
     truck_bucket = ensure_live_bucket(truck)
 
     for frame in payload.frames:
-        truck_bucket["frames"].append(sanitize_frame_dict(frame.dict()))
+        truck_bucket["frames"].append(
+            sanitize_frame_dict(frame.dict())
+        )
 
     if len(truck_bucket["frames"]) > MAX_LIVE_FRAMES_PER_TRUCK:
-        truck_bucket["frames"] = truck_bucket["frames"][-MAX_LIVE_FRAMES_PER_TRUCK:]
+        truck_bucket["frames"] = truck_bucket["frames"][
+            -MAX_LIVE_FRAMES_PER_TRUCK:
+        ]
+
+    now = time.time()
 
     truck_bucket["__stream__"]["snapshot_seq"] += 1
-    truck_bucket["__stream__"]["last_server_time"] = time.time()
-    truck_bucket["__stream__"]["snapshot_device_ms"] = payload.snapshot_device_ms
-    truck_bucket["__stream__"]["snapshot_unix_ms"] = payload.snapshot_unix_ms
+    truck_bucket["__stream__"]["last_server_time"] = now
+
+    # Este timestamp é a fonte oficial para o status de conexão CAN.
+    # Ele só é atualizado quando o backend recebe POST /signals.
+    truck_bucket["__stream__"]["last_snapshot_received_at"] = now
+
+    truck_bucket["__stream__"]["snapshot_device_ms"] = (
+        payload.snapshot_device_ms
+    )
+
+    truck_bucket["__stream__"]["snapshot_unix_ms"] = (
+        payload.snapshot_unix_ms
+    )
 
     current_meta = truck_bucket.get("__meta__", {})
+
     truck_bucket["__meta__"] = {
         "truck_id": payload.truck_id,
         "lat": payload.lat,
         "lon": payload.lon,
-        "updated_at": time.time(),
+        "updated_at": now,
         "mode": current_meta.get("mode", "online"),
-        "priority_mode": current_meta.get("priority_mode", False),
-        "pending_blackbox_upload": current_meta.get("pending_blackbox_upload", False),
-        "blackbox_locked_until_upload": current_meta.get("blackbox_locked_until_upload", False),
+        "priority_mode": current_meta.get(
+            "priority_mode",
+            False
+        ),
+        "pending_blackbox_upload": current_meta.get(
+            "pending_blackbox_upload",
+            False
+        ),
+        "blackbox_locked_until_upload": current_meta.get(
+            "blackbox_locked_until_upload",
+            False
+        ),
         "last_error": current_meta.get("last_error", ""),
         "chunk_status": current_meta.get("chunk_status", "idle")
     }
@@ -1060,7 +1161,10 @@ async def upload_live_signals(payload: LiveSignalsPayload):
     return {
         "status": "success",
         "processed_frames": len(payload.frames),
-        "snapshot_seq": truck_bucket["__stream__"]["snapshot_seq"]
+        "snapshot_seq": truck_bucket["__stream__"]["snapshot_seq"],
+
+        # Útil para diagnóstico do sniffer e do backend.
+        "last_snapshot_received_at": now
     }
 
 
