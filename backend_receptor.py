@@ -4,7 +4,7 @@ import time
 import uuid
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from typing import List, Dict, Any, Optional
@@ -1357,33 +1357,75 @@ def get_blackbox_events():
 
 
 @app.get("/api/blackbox/events/light")
-def get_blackbox_events_light():
+def get_blackbox_events_light(response: Response):
+    """
+    Retorna somente os metadados necessários para listar eventos EDR.
+
+    Não retorna workspace_log, raw_log ou offline_package, pois esses
+    conteúdos são carregados sob demanda quando o operador escolhe
+    baixar um evento específico.
+
+    Os headers evitam que proxies, browsers ou plataformas intermediárias
+    retornem uma versão antiga logo após a conclusão de um upload.
+    """
     try:
+        response.headers["Cache-Control"] = (
+            "no-store, no-cache, must-revalidate, max-age=0"
+        )
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+
         conn = get_db_connection()
         cursor = conn.cursor()
+
         cursor.execute(
-            "SELECT payload FROM blackbox_logs ORDER BY created_at DESC LIMIT %s",
+            """
+            SELECT payload
+            FROM blackbox_logs
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
             (BLACKBOX_EVENTS_LIGHT_LIMIT,)
         )
+
         rows = cursor.fetchall()
+
         cursor.close()
         conn.close()
 
         events = []
+
         for row in rows:
             record = row[0] or {}
             payload = record.get("payload", {}) or {}
             metadata = payload.get("metadata", {}) or {}
             event_summary = record.get("event_summary", {}) or {}
 
-            truck_id = metadata.get("truck_id") or event_summary.get("name") or "Volvo FH540 (Recuperado)"
-            timestamp = metadata.get("timestamp") or event_summary.get("timestamp") or "N/A"
-            trigger_event = metadata.get("trigger_event") or "Falha DM1 Detectada"
+            truck_id = (
+                metadata.get("truck_id")
+                or event_summary.get("name")
+                or "Volvo FH540 (Recuperado)"
+            )
+
+            timestamp = (
+                metadata.get("timestamp")
+                or event_summary.get("timestamp")
+                or "N/A"
+            )
+
+            trigger_event = (
+                metadata.get("trigger_event")
+                or "Falha DM1 Detectada"
+            )
+
             lat = metadata.get("lat", -25.4284)
             lon = metadata.get("lon", -49.2731)
 
             events.append({
-                "log_id": record.get("log_id") or event_summary.get("logId"),
+                "log_id": (
+                    record.get("log_id")
+                    or event_summary.get("logId")
+                ),
                 "event_summary": event_summary,
                 "metadata": {
                     "truck_id": truck_id,
@@ -1394,9 +1436,20 @@ def get_blackbox_events_light():
                 }
             })
 
-        return {"events": events}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao buscar eventos leves: {str(e)}")
+        return {
+            "events": events,
+            "count": len(events),
+            "generated_at": time.time()
+        }
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Erro ao buscar eventos leves: "
+                f"{str(error)}"
+            )
+        )
 
 
 @app.get("/api/blackbox/download/{log_id}")
