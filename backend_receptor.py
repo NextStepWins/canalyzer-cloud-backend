@@ -359,7 +359,178 @@ def get_dtc_text(spn, fmi):
         "caption": f"SPN Não Catalogada ({spn})",
         "ftb": f"FMI Genérico ({fmi})"
     })
+def extract_blackbox_fault_context(raw_log):
+    """
+    Extrai as falhas DM1 presentes no raw_log de uma caixa-preta.
 
+    O resultado é usado pelo endpoint leve de eventos para que o
+    frontend consiga filtrar por ECU/Source Address, SPN e FMI sem
+    baixar o log completo do evento.
+
+    Cada falha é identificada por:
+
+        Source Address + SPN + FMI
+
+    A ordem de retorno respeita a primeira ocorrência de cada DTC no
+    log da caixa-preta.
+    """
+    if not isinstance(raw_log, list):
+        return []
+
+    faults = []
+    seen_faults = set()
+
+    source_address_groups = {
+        0x00: {
+            "group": "Motor (EMS)",
+            "ecu": "EMS",
+            "ecu_name": "Engine #1 (EMS)"
+        },
+        0x0B: {
+            "group": "Freio (EBS)",
+            "ecu": "EBS",
+            "ecu_name": "Brakes (EBS/ABS)"
+        },
+        0x03: {
+            "group": "Transmissão (TECU)",
+            "ecu": "TECU",
+            "ecu_name": "Transmission (TECU)"
+        }
+    }
+
+    for raw_frame in raw_log:
+        if not isinstance(raw_frame, dict):
+            continue
+
+        frame = sanitize_frame_dict(raw_frame)
+
+        if not frame.get("extd", True):
+            continue
+
+        can_id = int(frame.get("id", 0) or 0)
+
+        try:
+            j1939_meta = decode_j1939_id(can_id)
+        except Exception:
+            continue
+
+        if j1939_meta.get("pgn") != 65226:
+            continue
+
+        data = frame.get("d", []) or []
+
+        if len(data) < 6:
+            continue
+
+        lamp_byte = data[0]
+        flash_lamp_byte = data[1]
+
+        source_address = int(
+            j1939_meta.get("sa", 0)
+        )
+
+        source_info = source_address_groups.get(
+            source_address,
+            {
+                "group": "Outros",
+                "ecu": f"SA 0x{source_address:02X}",
+                "ecu_name": J1939_NODE_NAMES.get(
+                    source_address,
+                    f"ECU desconhecida (SA 0x{source_address:02X})"
+                )
+            }
+        )
+
+        """
+        Uma DTC DM1 começa no byte 2 e ocupa 4 bytes:
+
+        byte 2: SPN bits 0..7
+        byte 3: SPN bits 8..15
+        byte 4: SPN bits 16..18 e FMI bits 0..4
+        byte 5: OC bits 0..6 e CM bit 7
+
+        CAN clássico possui normalmente uma DTC por frame. O loop
+        também suporta payloads reagrupados com múltiplas DTCs.
+        """
+        for offset in range(2, len(data) - 3, 4):
+            byte_0 = data[offset]
+            byte_1 = data[offset + 1]
+            byte_2 = data[offset + 2]
+            byte_3 = data[offset + 3]
+
+            if (
+                byte_0 == 0xFF
+                and byte_1 == 0xFF
+                and byte_2 == 0xFF
+                and byte_3 == 0xFF
+            ):
+                continue
+
+            spn = (
+                byte_0
+                | (byte_1 << 8)
+                | ((byte_2 & 0x07) << 16)
+            )
+
+            fmi = (byte_2 >> 3) & 0x1F
+            occurrence_count = byte_3 & 0x7F
+            conversion_method = (byte_3 >> 7) & 0x01
+
+            if spn == 0:
+                continue
+
+            fault_key = (
+                source_address,
+                spn,
+                fmi
+            )
+
+            if fault_key in seen_faults:
+                continue
+
+            seen_faults.add(fault_key)
+
+            dtc_text = get_dtc_text(spn, fmi)
+
+            faults.append({
+                "sa": source_address,
+                "sa_hex": f"0x{source_address:02X}",
+                "ecu": source_info["ecu"],
+                "ecu_name": source_info["ecu_name"],
+                "group": source_info["group"],
+
+                "spn": spn,
+                "fmi": fmi,
+                "oc": occurrence_count,
+                "cm": conversion_method,
+
+                "caption": dtc_text.get(
+                    "caption",
+                    f"SPN Não Catalogada ({spn})"
+                ),
+                "ftb": dtc_text.get(
+                    "ftb",
+                    f"FMI Genérico ({fmi})"
+                ),
+
+                "mil": lamp_byte & 0x03,
+                "red_stop": (lamp_byte >> 2) & 0x03,
+                "amber_warning": (lamp_byte >> 4) & 0x03,
+                "protect": (lamp_byte >> 6) & 0x03,
+
+                "flash_mil": flash_lamp_byte & 0x03,
+                "flash_red_stop": (
+                    flash_lamp_byte >> 2
+                ) & 0x03,
+                "flash_amber_warning": (
+                    flash_lamp_byte >> 4
+                ) & 0x03,
+                "flash_protect": (
+                    flash_lamp_byte >> 6
+                ) & 0x03
+            })
+
+    return faults
 
 def normalize_can_id(raw_id):
     if isinstance(raw_id, int):
@@ -1357,21 +1528,21 @@ def get_blackbox_events():
 
 
 @app.get("/api/blackbox/events/light")
+@app.get("/api/blackbox/events/light")
 def get_blackbox_events_light(response: Response):
     """
-    Retorna somente os metadados necessários para listar eventos EDR.
+    Retorna metadados leves dos eventos EDR.
 
-    Não retorna workspace_log, raw_log ou offline_package, pois esses
-    conteúdos são carregados sob demanda quando o operador escolhe
-    baixar um evento específico.
-
-    Os headers evitam que proxies, browsers ou plataformas intermediárias
-    retornem uma versão antiga logo após a conclusão de um upload.
+    Além dos dados de identificação, o endpoint inclui as DTCs DM1
+    encontradas no raw_log. Isso permite filtrar corretamente por
+    ECU, Source Address, SPN e FMI no frontend, sem transferir todo
+    o conteúdo da caixa-preta.
     """
     try:
         response.headers["Cache-Control"] = (
             "no-store, no-cache, must-revalidate, max-age=0"
         )
+
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
 
@@ -1397,9 +1568,30 @@ def get_blackbox_events_light(response: Response):
 
         for row in rows:
             record = row[0] or {}
+
+            if not isinstance(record, dict):
+                continue
+
             payload = record.get("payload", {}) or {}
             metadata = payload.get("metadata", {}) or {}
             event_summary = record.get("event_summary", {}) or {}
+
+            raw_log = payload.get("raw_log", []) or []
+
+            faults = extract_blackbox_fault_context(
+                raw_log
+            )
+
+            fault_groups = []
+
+            for fault in faults:
+                fault_group = fault.get("group")
+
+                if (
+                    fault_group
+                    and fault_group not in fault_groups
+                ):
+                    fault_groups.append(fault_group)
 
             truck_id = (
                 metadata.get("truck_id")
@@ -1421,19 +1613,41 @@ def get_blackbox_events_light(response: Response):
             lat = metadata.get("lat", -25.4284)
             lon = metadata.get("lon", -49.2731)
 
+            if faults:
+                preview_fault = faults[0]
+
+                fault_preview = (
+                    f"{preview_fault.get('ecu_name')} "
+                    f"({preview_fault.get('sa_hex')}) | "
+                    f"SPN {preview_fault.get('spn')} | "
+                    f"FMI {preview_fault.get('fmi')} | "
+                    f"{preview_fault.get('caption')}"
+                )
+            else:
+                fault_preview = (
+                    "Nenhuma DTC DM1 válida foi identificada "
+                    "no log da caixa-preta."
+                )
+
             events.append({
                 "log_id": (
                     record.get("log_id")
                     or event_summary.get("logId")
                 ),
+
                 "event_summary": event_summary,
+
                 "metadata": {
                     "truck_id": truck_id,
                     "timestamp": timestamp,
                     "trigger_event": trigger_event,
                     "lat": lat,
                     "lon": lon
-                }
+                },
+
+                "fault_groups": fault_groups,
+                "faults": faults,
+                "fault_preview": fault_preview
             })
 
         return {
