@@ -920,35 +920,188 @@ def parse_known_j1939(frame):
 
 
 def build_workspace_log(raw_log):
+    """
+    Constrói o log temporal usado pelo workspace/frontend.
+
+    Estratégia:
+
+    - gera um pacote lógico por segundo, 1 Hz;
+    - mantém o último frame CAN real de cada CAN ID;
+    - preenche cada snapshot com todos os CAN IDs conhecidos;
+    - identifica frames retidos com is_held=True;
+    - não repete uma DM1 retida, pois uma DTC antiga não pode continuar
+      aparecendo como ativa depois que a ECU deixou de retransmiti-la.
+
+    Compatibilidade:
+
+    - Novo sniffer:
+      todos os frames de um snapshot chegam com o mesmo timestamp.
+      O backend apenas preserva e organiza esse snapshot.
+
+    - Logs antigos:
+      frames podem chegar com timestamps diferentes. O backend cria
+      snapshots de 1 Hz usando o último valor CAN realmente recebido.
+    """
     if not isinstance(raw_log, list) or not raw_log:
         return []
 
-    grouped = {}
-    ordered_ts = []
+    sanitized_frames = []
 
     for raw_frame in raw_log:
+        if not isinstance(raw_frame, dict):
+            continue
+
         frame = sanitize_frame_dict(raw_frame)
+
+        # O workspace atual considera somente J1939 estendido.
         if not frame.get("extd", True):
             continue
 
-        t = int(frame.get("t", 0))
-        if t not in grouped:
-            grouped[t] = []
-            ordered_ts.append(t)
-        grouped[t].append(frame)
+        sanitized_frames.append(frame)
 
-    ordered_ts.sort()
-    base_t = ordered_ts[0] if ordered_ts else 0
+    if not sanitized_frames:
+        return []
+
+    # Ordem temporal estável, inclusive para frames com mesmo timestamp.
+    sanitized_frames.sort(
+        key=lambda frame: int(frame.get("t", 0) or 0)
+    )
+
+    first_timestamp_ms = int(
+        sanitized_frames[0].get("t", 0) or 0
+    )
+
+    last_timestamp_ms = int(
+        sanitized_frames[-1].get("t", 0) or 0
+    )
+
+    """
+    O último snapshot é arredondado para cima para garantir que frames
+    recebidos, por exemplo, em 850 ms, sejam incluídos no snapshot de
+    1.000 ms em vez de serem descartados.
+
+    Exemplo:
+        primeiro frame: 0 ms
+        último frame:   850 ms
+
+        snapshots gerados:
+        - 0 ms
+        - 1000 ms
+    """
+    duration_ms = max(
+        0,
+        last_timestamp_ms - first_timestamp_ms
+    )
+
+    final_snapshot_offset_ms = (
+        ((duration_ms + 999) // 1000) * 1000
+    )
+
+    final_snapshot_timestamp_ms = (
+        first_timestamp_ms
+        + final_snapshot_offset_ms
+    )
+
+    """
+    Cache persistente por CAN ID.
+
+    Cada posição contém:
+    - frame: último frame CAN real recebido;
+    - source_timestamp_ms: timestamp original desse frame.
+    """
+    latest_frame_by_can_id = {}
+
     workspace_log = []
+    next_frame_index = 0
+    frame_count = len(sanitized_frames)
 
-    for t in ordered_ts:
+    snapshot_timestamp_ms = first_timestamp_ms
+
+    while (
+        snapshot_timestamp_ms
+        <= final_snapshot_timestamp_ms
+    ):
+        """
+        Incorpora todos os frames reais recebidos até o instante do
+        snapshot atual.
+
+        Se dois frames do mesmo CAN ID chegarem dentro do mesmo segundo,
+        o último recebido é preservado, exatamente como acontece no
+        cache do firmware.
+        """
+        while (
+            next_frame_index < frame_count
+            and int(
+                sanitized_frames[next_frame_index].get(
+                    "t",
+                    0
+                ) or 0
+            ) <= snapshot_timestamp_ms
+        ):
+            incoming_frame = sanitized_frames[
+                next_frame_index
+            ]
+
+            can_id = int(
+                incoming_frame.get("id", 0) or 0
+            )
+
+            source_timestamp_ms = int(
+                incoming_frame.get("t", 0) or 0
+            )
+
+            latest_frame_by_can_id[can_id] = {
+                "frame": incoming_frame,
+                "source_timestamp_ms": source_timestamp_ms
+            }
+
+            next_frame_index += 1
+
         frames_out = []
-        sigs = {}
+        signals_out = {}
 
-        for frame in grouped[t]:
-            parsed = parse_known_j1939(frame)
+        """
+        Ordena por CAN ID para gerar um workspace determinístico.
+        Isso facilita comparação, exportação e análise offline.
+        """
+        for can_id in sorted(
+            latest_frame_by_can_id.keys()
+        ):
+            cached_item = latest_frame_by_can_id[can_id]
+
+            cached_frame = cached_item["frame"]
+
+            source_timestamp_ms = int(
+                cached_item["source_timestamp_ms"]
+            )
+
+            is_held = (
+                source_timestamp_ms
+                < snapshot_timestamp_ms
+            )
+
+            parsed = parse_known_j1939(
+                cached_frame
+            )
 
             if not parsed.get("is_j1939", False):
+                continue
+
+            """
+            Regra especial para DM1:
+
+            Uma DM1 retida não pode ser repetida indefinidamente, pois
+            isso manteria uma falha antiga visível como se a ECU ainda
+            estivesse confirmando-a.
+
+            A DM1 aparece somente no instante em que foi realmente
+            recebida. Mensagens telemétricas normais permanecem retidas
+            para preencher as curvas em 1 Hz.
+            """
+            if (
+                parsed.get("message") == "DM1"
+                and is_held
+            ):
                 continue
 
             frames_out.append({
@@ -961,23 +1114,55 @@ def build_workspace_log(raw_log):
                 "decoded": parsed["decoded"],
                 "pgn": parsed.get("pgn"),
                 "sa": parsed.get("sa"),
-                "da": parsed.get("da")
+                "da": parsed.get("da"),
+
+                # Metadados úteis para auditoria e futura visualização.
+                "is_held": is_held,
+                "source_timestamp_ms": source_timestamp_ms
             })
 
-            if parsed["sigs"]:
-                sigs.update(parsed["sigs"])
+            """
+            Para telemetria regular, parsed.sigs contém valores reais
+            extraídos do último frame CAN recebido.
 
-        if frames_out:
-            rel = (t - base_t) / 1000.0
-            workspace_log.append({
-                "time": to_time_label_from_seconds(rel),
-                "rel": rel,
-                "sigs": sigs,
-                "frames": frames_out
-            })
+            Se is_held=True, o valor é o último valor real conhecido,
+            e não um valor interpolado ou estimado.
+            """
+            if parsed.get("sigs"):
+                signals_out.update(
+                    parsed["sigs"]
+                )
+
+        """
+        Adiciona a linha temporal mesmo se nenhum frame estiver disponível.
+
+        Em condições normais, haverá ao menos um frame depois do primeiro
+        timestamp. O comportamento também preserva a cadência de 1 Hz
+        caso o log tenha uma janela temporária sem dados.
+        """
+        relative_seconds = (
+            snapshot_timestamp_ms
+            - first_timestamp_ms
+        ) / 1000.0
+
+        workspace_log.append({
+            "time": to_time_label_from_seconds(
+                relative_seconds
+            ),
+            "rel": relative_seconds,
+            "sigs": signals_out,
+            "frames": frames_out,
+
+            # Metadados do snapshot lógico.
+            "snapshot_timestamp_ms": (
+                snapshot_timestamp_ms
+            ),
+            "is_gap": len(frames_out) == 0
+        })
+
+        snapshot_timestamp_ms += 1000
 
     return workspace_log
-
 
 def build_markers_from_workspace_log(workspace_log):
     markers = []
