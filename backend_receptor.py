@@ -359,101 +359,6 @@ def get_dtc_text(spn, fmi):
         "caption": f"SPN Não Catalogada ({spn})",
         "ftb": f"FMI Genérico ({fmi})"
     })
-
-def extract_blackbox_fault_context(raw_log):
-    """
-    Extrai dados brutos de DTCs DM1 do raw_log.
-
-    Não traduz SPN/FMI nem ECU. O frontend será responsável por:
-    - DTC_DICT: descrição da falha;
-    - DBC: transmissor/ECU pelo CAN ID da DM1.
-    """
-    if not isinstance(raw_log, list):
-        return []
-
-    faults = []
-    seen_faults = set()
-
-    for raw_frame in raw_log:
-        if not isinstance(raw_frame, dict):
-            continue
-
-        frame = sanitize_frame_dict(raw_frame)
-
-        if not frame.get("extd", True):
-            continue
-
-        can_id = int(frame.get("id", 0) or 0)
-
-        try:
-            meta = decode_j1939_id(can_id)
-        except Exception:
-            continue
-
-        if meta.get("pgn") != 65226:
-            continue
-
-        data = frame.get("d", []) or []
-
-        if len(data) < 6:
-            continue
-
-        source_address = int(meta.get("sa", 0) or 0)
-
-        for offset in range(2, len(data) - 3, 4):
-            byte_0 = int(data[offset]) & 0xFF
-            byte_1 = int(data[offset + 1]) & 0xFF
-            byte_2 = int(data[offset + 2]) & 0xFF
-            byte_3 = int(data[offset + 3]) & 0xFF
-
-            if (
-                byte_0 == 0xFF
-                and byte_1 == 0xFF
-                and byte_2 == 0xFF
-                and byte_3 == 0xFF
-            ):
-                continue
-
-            spn = (
-                byte_0
-                | (byte_1 << 8)
-                | ((byte_2 & 0x07) << 16)
-            )
-
-            fmi = (byte_2 >> 3) & 0x1F
-            occurrence_count = byte_3 & 0x7F
-            conversion_method = (byte_3 >> 7) & 0x01
-
-            if spn == 0:
-                continue
-
-            fault_key = (
-                can_id,
-                source_address,
-                spn,
-                fmi
-            )
-
-            if fault_key in seen_faults:
-                continue
-
-            seen_faults.add(fault_key)
-
-            faults.append({
-                "can_id": can_id,
-                "can_id_hex": f"0x{can_id:08X}",
-
-                "sa": source_address,
-                "sa_hex": f"0x{source_address:02X}",
-
-                "spn": spn,
-                "fmi": fmi,
-                "oc": occurrence_count,
-                "cm": conversion_method
-            })
-
-    return faults
-    
 def extract_blackbox_fault_context(raw_log):
     """
     Extrai as falhas DM1 presentes no raw_log de uma caixa-preta.
@@ -1624,16 +1529,23 @@ def get_blackbox_events():
 
 @app.get("/api/blackbox/events/light")
 @app.get("/api/blackbox/events/light")
-def get_blackbox_events_light():
+def get_blackbox_events_light(response: Response):
     """
-    Retorna somente os dados necessários para listar e filtrar eventos
-    EDR no mapa.
+    Retorna metadados leves dos eventos EDR.
 
-    As DTCs são retornadas em formato bruto. O frontend traduz:
-    - ECU/SA pelo DBC;
-    - SPN/FMI pelo DTC_DICT.
+    Além dos dados de identificação, o endpoint inclui as DTCs DM1
+    encontradas no raw_log. Isso permite filtrar corretamente por
+    ECU, Source Address, SPN e FMI no frontend, sem transferir todo
+    o conteúdo da caixa-preta.
     """
     try:
+        response.headers["Cache-Control"] = (
+            "no-store, no-cache, must-revalidate, max-age=0"
+        )
+
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+
         conn = get_db_connection()
         cursor = conn.cursor()
 
@@ -1666,6 +1578,57 @@ def get_blackbox_events_light():
 
             raw_log = payload.get("raw_log", []) or []
 
+            faults = extract_blackbox_fault_context(
+                raw_log
+            )
+
+            fault_groups = []
+
+            for fault in faults:
+                fault_group = fault.get("group")
+
+                if (
+                    fault_group
+                    and fault_group not in fault_groups
+                ):
+                    fault_groups.append(fault_group)
+
+            truck_id = (
+                metadata.get("truck_id")
+                or event_summary.get("name")
+                or "Volvo FH540 (Recuperado)"
+            )
+
+            timestamp = (
+                metadata.get("timestamp")
+                or event_summary.get("timestamp")
+                or "N/A"
+            )
+
+            trigger_event = (
+                metadata.get("trigger_event")
+                or "Falha DM1 Detectada"
+            )
+
+            lat = metadata.get("lat", -25.4284)
+            lon = metadata.get("lon", -49.2731)
+
+            if faults:
+                preview_fault = faults[0]
+
+                fault_preview = (
+                    f"{preview_fault.get('ecu_name')} "
+                    f"({preview_fault.get('sa_hex')}) | "
+                    f"SPN {preview_fault.get('spn')} | "
+                    f"FMI {preview_fault.get('fmi')} | "
+                    f"{preview_fault.get('caption')}"
+                )
+            else:
+                fault_preview = (
+                    "Nenhuma DTC DM1 válida foi identificada "
+                    "no log da caixa-preta."
+                )
+
             events.append({
                 "log_id": (
                     record.get("log_id")
@@ -1675,30 +1638,16 @@ def get_blackbox_events_light():
                 "event_summary": event_summary,
 
                 "metadata": {
-                    "truck_id": (
-                        metadata.get("truck_id")
-                        or event_summary.get("name")
-                        or "Volvo FH540 (Recuperado)"
-                    ),
-
-                    "timestamp": (
-                        metadata.get("timestamp")
-                        or event_summary.get("timestamp")
-                        or "N/A"
-                    ),
-
-                    "trigger_event": (
-                        metadata.get("trigger_event")
-                        or "Falha DM1 Detectada"
-                    ),
-
-                    "lat": metadata.get("lat", -25.4284),
-                    "lon": metadata.get("lon", -49.2731)
+                    "truck_id": truck_id,
+                    "timestamp": timestamp,
+                    "trigger_event": trigger_event,
+                    "lat": lat,
+                    "lon": lon
                 },
 
-                "faults": extract_blackbox_fault_context(
-                    raw_log
-                )
+                "fault_groups": fault_groups,
+                "faults": faults,
+                "fault_preview": fault_preview
             })
 
         return {
@@ -1715,6 +1664,7 @@ def get_blackbox_events_light():
                 f"{str(error)}"
             )
         )
+
 
 @app.get("/api/blackbox/download/{log_id}")
 def download_blackbox_log(log_id: str):
