@@ -724,40 +724,113 @@ def decode_vdhr(payload_bytes):
 
 
 def decode_dm1(payload_bytes):
-    if len(payload_bytes) < 4:
+    if len(payload_bytes) < 6:
         return {
             "message": "DM1",
-            "decoded": "Diagnostic Message 1",
+            "decoded": "Diagnostic Message 1, payload incompleto",
             "sigs": {},
             "dtc": None
         }
 
-    spn = (payload_bytes[2] << 8) | payload_bytes[1]
-    fmi = payload_bytes[3] & 0x1F
-    oc = payload_bytes[4] if len(payload_bytes) > 4 else 0
+    lamp_byte = payload_bytes[0]
+    flash_lamp_byte = payload_bytes[1]
+
+    dtc_byte_0 = payload_bytes[2]
+    dtc_byte_1 = payload_bytes[3]
+    dtc_byte_2 = payload_bytes[4]
+    dtc_byte_3 = payload_bytes[5]
+
+    # FF FF FF FF representa ausência de DTC ativa.
+    if (
+        dtc_byte_0 == 0xFF
+        and dtc_byte_1 == 0xFF
+        and dtc_byte_2 == 0xFF
+        and dtc_byte_3 == 0xFF
+    ):
+        return {
+            "message": "DM1",
+            "decoded": "No Active DTCs",
+            "sigs": {
+                "ActiveDTCCount": 0,
+                "DM1_MIL": lamp_byte & 0x03,
+                "DM1_RedStopLamp": (lamp_byte >> 2) & 0x03,
+                "DM1_AmberWarningLamp": (
+                    lamp_byte >> 4
+                ) & 0x03,
+                "DM1_ProtectLamp": (lamp_byte >> 6) & 0x03,
+                "DM1_FlashMIL": flash_lamp_byte & 0x03,
+                "DM1_FlashRedStopLamp": (
+                    flash_lamp_byte >> 2
+                ) & 0x03,
+                "DM1_FlashAmberWarningLamp": (
+                    flash_lamp_byte >> 4
+                ) & 0x03,
+                "DM1_FlashProtectLamp": (
+                    flash_lamp_byte >> 6
+                ) & 0x03
+            },
+            "dtc": None
+        }
+
+    spn = (
+        dtc_byte_0
+        | (dtc_byte_1 << 8)
+        | ((dtc_byte_2 & 0x07) << 16)
+    )
+
+    fmi = (dtc_byte_2 >> 3) & 0x1F
+    oc = dtc_byte_3 & 0x7F
+    cm = (dtc_byte_3 >> 7) & 0x01
 
     if spn == 0:
         return {
             "message": "DM1",
             "decoded": "No Active DTCs",
-            "sigs": {"ActiveDTCCount": 0},
+            "sigs": {
+                "ActiveDTCCount": 0
+            },
             "dtc": None
         }
 
     info = get_dtc_text(spn, fmi)
+
     return {
         "message": "DM1",
-        "decoded": f"Active Diagnostic Trouble Codes | SPN={spn} | FMI={fmi} | OC={oc}",
+        "decoded": (
+            "Active Diagnostic Trouble Codes"
+            f" | SPN={spn}"
+            f" | FMI={fmi}"
+            f" | OC={oc}"
+            f" | CM={cm}"
+        ),
         "sigs": {
             "ActiveDTCCount": 1,
             "DM1_SPN": spn,
             "DM1_FMI": fmi,
-            "DM1_OC": oc
+            "DM1_OC": oc,
+            "DM1_CM": cm,
+            "DM1_MIL": lamp_byte & 0x03,
+            "DM1_RedStopLamp": (lamp_byte >> 2) & 0x03,
+            "DM1_AmberWarningLamp": (
+                lamp_byte >> 4
+            ) & 0x03,
+            "DM1_ProtectLamp": (lamp_byte >> 6) & 0x03,
+            "DM1_FlashMIL": flash_lamp_byte & 0x03,
+            "DM1_FlashRedStopLamp": (
+                flash_lamp_byte >> 2
+            ) & 0x03,
+            "DM1_FlashAmberWarningLamp": (
+                flash_lamp_byte >> 4
+            ) & 0x03,
+            "DM1_FlashProtectLamp": (
+                flash_lamp_byte >> 6
+            ) & 0x03
         },
         "dtc": {
             "spn": spn,
             "fmi": fmi,
             "oc": oc,
+            "cm": cm,
             "caption": info["caption"],
             "ftb": info["ftb"]
         }
