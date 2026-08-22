@@ -8,7 +8,6 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from typing import List, Dict, Any, Optional
-from collections import OrderedDict
 
 app = FastAPI(title="CANalyzer Pro Backend - Híbrido (Streaming & EDR)")
 
@@ -35,31 +34,11 @@ MAX_LIVE_FRAMES_PER_TRUCK = 2000
 BLACKBOX_EVENTS_LIGHT_LIMIT = 100
 PENDING_BLACKBOX_TTL_SECONDS = 900
 
-# ============================================================================
-# TELEMETRIA LIVE CONFIÁVEL
-# ============================================================================
-#
-# Este armazenamento é separado da EDR.
-#
-# Não usa blackbox_logs.
-# Não usa pending_blackbox_chunks.
-# Não altera log_buffer do firmware.
-#
-# A retenção é curta e existe apenas para o player de 7 s, polling,
-# jitter de rede e reconexões breves enquanto a sessão ainda é válida.
-LIVE_SESSION_LEASE_SECONDS = 12.0
-LIVE_SNAPSHOT_RETENTION_SECONDS = 60.0
-LIVE_SNAPSHOT_RETENTION_MAX = 90
-live_sessions = {}
-
 
 class HeartbeatTruckResponse(BaseModel):
     status: str
     user_is_monitoring: bool
     truck_id: str
-    live_delivery_enabled: bool = False
-    live_session_id: Optional[str] = None
-    live_lease_expires_at_ms: Optional[int] = None
 
 
 class BlackboxMetadata(BaseModel):
@@ -107,10 +86,6 @@ class LiveSignalsPayload(BaseModel):
     lon: float | None = None
     snapshot_device_ms: Optional[int] = None
     snapshot_unix_ms: Optional[int] = None
-    # Campos novos, usados somente pela telemetria live confiável.
-    live_session_id: Optional[str] = None
-    boot_id: Optional[str] = None
-    snapshot_seq: Optional[int] = None
 
 
 class TruckRegisterPayload(BaseModel):
@@ -127,15 +102,6 @@ class TruckRegisterPayload(BaseModel):
 
 class TruckStatePayload(BaseModel):
     state: str
-
-
-class LiveSessionOpenPayload(BaseModel):
-    truck_id: str
-
-class LiveSessionHeartbeatPayload(BaseModel):
-    truck_id: str
-    live_session_id: str
-    last_played_snapshot_seq: Optional[int] = None
 
 
 class BlackboxChunkUpload(BaseModel):
@@ -289,103 +255,6 @@ def ensure_live_bucket(truck_id: str):
 
     return live_signals_db[truck_id]
 
-def now_epoch_ms() -> int:
-    return int(time.time() * 1000)
-
-def cleanup_live_sessions():
-    """
-    Remove sessões expiradas.
-    A telemetria live não é histórica. Ao expirar o lease, snapshots
-    pendentes daquela sessão deixam de ser recuperáveis pelo app.
-    """
-    now = time.time()
-    expired_ids = [
-        session_id
-        for session_id, session in live_sessions.items()
-        if float(session.get("lease_expires_at", 0.0)) <= now
-    ]
-    for session_id in expired_ids:
-        del live_sessions[session_id]
-
-def close_live_sessions_for_truck(truck_id: str):
-    session_ids = [
-        session_id
-        for session_id, session in live_sessions.items()
-        if session.get("truck_id") == truck_id
-    ]
-    for session_id in session_ids:
-        del live_sessions[session_id]
-
-def get_live_session(
-    truck_id: str,
-    live_session_id: str
-):
-    cleanup_live_sessions()
-    session = live_sessions.get(live_session_id)
-    if not session:
-        return None
-    if session.get("truck_id") != truck_id:
-        return None
-    return session
-
-def cleanup_live_snapshots(session: dict):
-    """
-    Mantém apenas snapshots recentes da sessão atual.
-    O conteúdo é intencionalmente temporário e não substitui EDR.
-    """
-    snapshots = session.get("snapshots")
-    if not isinstance(snapshots, OrderedDict):
-        session["snapshots"] = OrderedDict()
-        return
-    now = time.time()
-    expired_keys = [
-        key
-        for key, snapshot in snapshots.items()
-        if (
-            now - float(snapshot.get("stored_at", 0.0))
-            > LIVE_SNAPSHOT_RETENTION_SECONDS
-        )
-    ]
-    for key in expired_keys:
-        snapshots.pop(key, None)
-    while len(snapshots) > LIVE_SNAPSHOT_RETENTION_MAX:
-        snapshots.popitem(last=False)
-
-def create_live_session(truck_id: str) -> dict:
-    """
-    Cria uma sessão exclusiva para o visualizador atual.
-    Uma nova sessão encerra a sessão live anterior da mesma unidade,
-    pois a telemetria não deve ser reproduzida para uma conexão futura.
-    """
-    cleanup_live_sessions()
-    close_live_sessions_for_truck(truck_id)
-    session_id = f"live_{uuid.uuid4().hex}"
-    lease_expires_at = (
-        time.time() + LIVE_SESSION_LEASE_SECONDS
-    )
-    session = {
-        "truck_id": truck_id,
-        "created_at": time.time(),
-        "lease_expires_at": lease_expires_at,
-        "last_heartbeat_at": time.time(),
-        "last_played_snapshot_seq": None,
-        "current_boot_id": None,
-        # Chave: "boot_id:snapshot_seq"
-        "snapshots": OrderedDict()
-    }
-    live_sessions[session_id] = session
-    truck_state = ensure_truck_state(truck_id)
-    truck_state["desired_state"] = "online"
-    truck_state["user_is_monitoring"] = True
-    truck_state["last_heartbeat_time"] = time.time()
-    return {
-        "truck_id": truck_id,
-        "live_session_id": session_id,
-        "lease_expires_at_ms": int(
-            lease_expires_at * 1000
-        ),
-        "playback_delay_snapshots": 7
-    }
 
 def cleanup_stale_pending_blackbox_chunks():
     conn = get_db_connection()
@@ -1511,144 +1380,40 @@ def persist_blackbox_record(metadata_dict, raw_log, log_format="raw_can"):
 
 
 @app.post("/api/truck-state/{truck_id}")
-def set_truck_state_endpoint(
-    truck_id: str,
-    payload: TruckStatePayload
-):
+def set_truck_state_endpoint(truck_id: str, payload: TruckStatePayload):
     truck_state = ensure_truck_state(truck_id)
-    desired_state = (
-        payload.state or ""
-    ).strip().lower()
-    if desired_state not in {
-        "online",
-        "sentinel"
-    }:
-        raise HTTPException(
-            status_code=400,
-            detail="Estado inválido. Use 'online' ou 'sentinel'."
-        )
+    desired_state = (payload.state or "").strip().lower()
+
+    if desired_state not in {"online", "sentinel"}:
+        raise HTTPException(status_code=400, detail="Estado inválido. Use 'online' ou 'sentinel'.")
+
     truck_state["desired_state"] = desired_state
-    truck_state["user_is_monitoring"] = (
-        desired_state == "online"
-    )
+    truck_state["user_is_monitoring"] = (desired_state == "online")
     if desired_state == "online":
         truck_state["last_heartbeat_time"] = time.time()
     else:
         truck_state["last_heartbeat_time"] = 0.0
-        # Encerrar live não interfere em EDR.
-        close_live_sessions_for_truck(truck_id)
+
     return {
         "status": "success",
         "truck_id": truck_id,
         "desired_state": desired_state,
-        "user_is_monitoring": (
-            truck_state["user_is_monitoring"]
-        )
+        "user_is_monitoring": truck_state["user_is_monitoring"]
     }
 
-@app.post("/api/live-sessions/open")
-def open_live_session(
-    payload: LiveSessionOpenPayload
-):
-    return create_live_session(
-        payload.truck_id
-    )
-
-@app.post("/api/live-sessions/heartbeat")
-def heartbeat_live_session(
-    payload: LiveSessionHeartbeatPayload
-):
-    session = get_live_session(
-        payload.truck_id,
-        payload.live_session_id
-    )
-    if not session:
-        return {
-            "status": "session_expired",
-            "live_delivery_enabled": False,
-            "session_expired": True
-        }
-    lease_expires_at = (
-        time.time() + LIVE_SESSION_LEASE_SECONDS
-    )
-    session["lease_expires_at"] = lease_expires_at
-    session["last_heartbeat_at"] = time.time()
-    session["last_played_snapshot_seq"] = (
-        payload.last_played_snapshot_seq
-    )
-    return {
-        "status": "ok",
-        "truck_id": payload.truck_id,
-        "live_session_id": payload.live_session_id,
-        "live_delivery_enabled": True,
-        "lease_expires_at_ms": int(
-            lease_expires_at * 1000
-        )
-    }
-
-@app.post("/api/live-sessions/close")
-def close_live_session(
-    payload: LiveSessionHeartbeatPayload
-):
-    session = live_sessions.get(
-        payload.live_session_id
-    )
-    if (
-        session
-        and session.get("truck_id") == payload.truck_id
-    ):
-        del live_sessions[
-            payload.live_session_id
-        ]
-    return {
-        "status": "closed",
-        "truck_id": payload.truck_id,
-        "live_session_id": payload.live_session_id
-    }
 
 @app.get("/api/status/{truck_id}")
-async def check_system_status_for_truck(
-    truck_id: str
-) -> HeartbeatTruckResponse:
-    cleanup_live_sessions()
+async def check_system_status_for_truck(truck_id: str) -> HeartbeatTruckResponse:
     truck_state = ensure_truck_state(truck_id)
-    active_session_id = None
-    active_session = None
-    for session_id, session in live_sessions.items():
-        if session.get("truck_id") == truck_id:
-            active_session_id = session_id
-            active_session = session
-            break
-    live_delivery_enabled = (
-        active_session is not None
-        and truck_state.get("desired_state") == "online"
-    )
-    if live_delivery_enabled:
-        lease_expires_at_ms = int(
-            float(
-                active_session[
-                    "lease_expires_at"
-                ]
-            ) * 1000
-        )
-        truck_state["user_is_monitoring"] = True
-    else:
-        lease_expires_at_ms = None
-        truck_state["user_is_monitoring"] = False
+    desired_state = truck_state.get("desired_state", "sentinel")
+    truck_state["user_is_monitoring"] = (desired_state == "online")
+
     return HeartbeatTruckResponse(
         status="ok",
-        truck_id=truck_id,
-        user_is_monitoring=(
-            truck_state["user_is_monitoring"]
-        ),
-        live_delivery_enabled=(
-            live_delivery_enabled
-        ),
-        live_session_id=active_session_id,
-        live_lease_expires_at_ms=(
-            lease_expires_at_ms
-        )
+        user_is_monitoring=truck_state["user_is_monitoring"],
+        truck_id=truck_id
     )
+
 
 @app.post("/api/trucks/register")
 def register_truck(payload: TruckRegisterPayload):
@@ -1681,6 +1446,8 @@ def register_truck(payload: TruckRegisterPayload):
         "truck_id": payload.truck_id
     }
 
+
+@app.get("/api/trucks/online")
 
 @app.get("/api/trucks/online")
 def get_online_trucks():
@@ -1765,201 +1532,45 @@ def get_online_trucks():
     }
 
 @app.post("/signals")
-async def upload_live_signals(
-    payload: LiveSignalsPayload
-):
-    """
-    Aceita dois formatos:
-    1. Legado, sem live_session_id:
-       Mantém a compatibilidade durante a transição.
-    2. Live confiável:
-       Exige session_id, boot_id e snapshot_seq.
-       Deduplica e responde ACK explícito.
-    """
+async def upload_live_signals(payload: LiveSignalsPayload):
     truck = payload.truck_id
     truck_bucket = ensure_live_bucket(truck)
-    is_reliable_live_snapshot = (
-        bool(payload.live_session_id)
-        and bool(payload.boot_id)
-        and payload.snapshot_seq is not None
-    )
-    # ------------------------------------------------------------------------
-    # Compatibilidade temporária com o firmware antigo.
-    # ------------------------------------------------------------------------
-    if not is_reliable_live_snapshot:
-        for frame in payload.frames:
-            truck_bucket["frames"].append(
-                sanitize_frame_dict(frame.dict())
-            )
-        if (
-            len(truck_bucket["frames"])
-            > MAX_LIVE_FRAMES_PER_TRUCK
-        ):
-            truck_bucket["frames"] = (
-                truck_bucket["frames"][
-                    -MAX_LIVE_FRAMES_PER_TRUCK:
-                ]
-            )
-        now = time.time()
-        truck_bucket["__stream__"][
-            "snapshot_seq"
-        ] += 1
-        truck_bucket["__stream__"][
-            "last_server_time"
-        ] = now
-        truck_bucket["__stream__"][
-            "last_snapshot_received_at"
-        ] = now
-        truck_bucket["__stream__"][
-            "snapshot_device_ms"
-        ] = payload.snapshot_device_ms
-        truck_bucket["__stream__"][
-            "snapshot_unix_ms"
-        ] = payload.snapshot_unix_ms
-        current_meta = truck_bucket.get(
-            "__meta__",
-            {}
-        )
-        truck_bucket["__meta__"] = {
-            "truck_id": payload.truck_id,
-            "lat": payload.lat,
-            "lon": payload.lon,
-            "updated_at": now,
-            "mode": current_meta.get(
-                "mode",
-                "online"
-            ),
-            "priority_mode": current_meta.get(
-                "priority_mode",
-                False
-            ),
-            "pending_blackbox_upload": current_meta.get(
-                "pending_blackbox_upload",
-                False
-            ),
-            "blackbox_locked_until_upload": (
-                current_meta.get(
-                    "blackbox_locked_until_upload",
-                    False
-                )
-            ),
-            "last_error": current_meta.get(
-                "last_error",
-                ""
-            ),
-            "chunk_status": current_meta.get(
-                "chunk_status",
-                "idle"
-            )
-        }
-        return {
-            "status": "success",
-            "processed_frames": len(payload.frames),
-            "snapshot_seq": truck_bucket[
-                "__stream__"
-            ]["snapshot_seq"],
-            "last_snapshot_received_at": now
-        }
-    # ------------------------------------------------------------------------
-    # Novo modo live confiável.
-    # ------------------------------------------------------------------------
-    session = get_live_session(
-        truck,
-        payload.live_session_id
-    )
-    if not session:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Sessão live ausente ou expirada. "
-                "Não reenviar backlog fora da sessão."
-            )
-        )
-    boot_id = str(payload.boot_id)
-    snapshot_seq = int(payload.snapshot_seq)
-    current_boot_id = session.get(
-        "current_boot_id"
-    )
-    """
-    Um reboot cria uma nova sequência.
-    Como telemetria live não é histórica, o backend limpa apenas os
-    snapshots desta sessão quando detecta boot_id novo.
-    """
-    if (
-        current_boot_id is not None
-        and current_boot_id != boot_id
-    ):
-        session["snapshots"] = OrderedDict()
-    session["current_boot_id"] = boot_id
-    snapshot_key = (
-        f"{boot_id}:{snapshot_seq}"
-    )
-    snapshots = session["snapshots"]
-    if snapshot_key in snapshots:
-        return {
-            "status": "already_accepted",
-            "truck_id": truck,
-            "live_session_id": payload.live_session_id,
-            "boot_id": boot_id,
-            "snapshot_seq": snapshot_seq
-        }
-    now = time.time()
-    snapshot = {
-        "truck_id": truck,
-        "live_session_id": (
-            payload.live_session_id
-        ),
-        "boot_id": boot_id,
-        "snapshot_seq": snapshot_seq,
-        "snapshot_device_ms": (
-            payload.snapshot_device_ms
-        ),
-        "snapshot_unix_ms": (
-            payload.snapshot_unix_ms
-        ),
-        "server_time": now,
-        "lat": payload.lat,
-        "lon": payload.lon,
-        "frames": [
+
+    for frame in payload.frames:
+        truck_bucket["frames"].append(
             sanitize_frame_dict(frame.dict())
-            for frame in payload.frames
-        ],
-        "stored_at": now
-    }
-    snapshots[snapshot_key] = snapshot
-    cleanup_live_snapshots(session)
-    """
-    Atualiza o estado usado pelo painel de caminhões online.
-    Não altera a retenção por sessão.
-    """
-    truck_bucket["__stream__"][
-        "snapshot_seq"
-    ] += 1
-    truck_bucket["__stream__"][
-        "last_server_time"
-    ] = now
-    truck_bucket["__stream__"][
-        "last_snapshot_received_at"
-    ] = now
-    truck_bucket["__stream__"][
-        "snapshot_device_ms"
-    ] = payload.snapshot_device_ms
-    truck_bucket["__stream__"][
-        "snapshot_unix_ms"
-    ] = payload.snapshot_unix_ms
-    current_meta = truck_bucket.get(
-        "__meta__",
-        {}
+        )
+
+    if len(truck_bucket["frames"]) > MAX_LIVE_FRAMES_PER_TRUCK:
+        truck_bucket["frames"] = truck_bucket["frames"][
+            -MAX_LIVE_FRAMES_PER_TRUCK:
+        ]
+
+    now = time.time()
+
+    truck_bucket["__stream__"]["snapshot_seq"] += 1
+    truck_bucket["__stream__"]["last_server_time"] = now
+
+    # Este timestamp é a fonte oficial para o status de conexão CAN.
+    # Ele só é atualizado quando o backend recebe POST /signals.
+    truck_bucket["__stream__"]["last_snapshot_received_at"] = now
+
+    truck_bucket["__stream__"]["snapshot_device_ms"] = (
+        payload.snapshot_device_ms
     )
+
+    truck_bucket["__stream__"]["snapshot_unix_ms"] = (
+        payload.snapshot_unix_ms
+    )
+
+    current_meta = truck_bucket.get("__meta__", {})
+
     truck_bucket["__meta__"] = {
-        "truck_id": truck,
+        "truck_id": payload.truck_id,
         "lat": payload.lat,
         "lon": payload.lon,
         "updated_at": now,
-        "mode": current_meta.get(
-            "mode",
-            "online"
-        ),
+        "mode": current_meta.get("mode", "online"),
         "priority_mode": current_meta.get(
             "priority_mode",
             False
@@ -1972,97 +1583,19 @@ async def upload_live_signals(
             "blackbox_locked_until_upload",
             False
         ),
-        "last_error": current_meta.get(
-            "last_error",
-            ""
-        ),
-        "chunk_status": current_meta.get(
-            "chunk_status",
-            "idle"
-        )
-    }
-    return {
-        "status": "accepted",
-        "truck_id": truck,
-        "live_session_id": payload.live_session_id,
-        "boot_id": boot_id,
-        "snapshot_seq": snapshot_seq,
-        "received_at_ms": now_epoch_ms()
+        "last_error": current_meta.get("last_error", ""),
+        "chunk_status": current_meta.get("chunk_status", "idle")
     }
 
-@app.get("/signals/live")
-async def get_live_snapshots(
-    truck_id: str,
-    live_session_id: str,
-    after_seq: int = -1
-):
-    """
-    Endpoint exclusivo do player live.
-    Não limpa dados após leitura.
-    Não devolve snapshots de outra sessão.
-    Não devolve backlog depois de o lease expirar.
-    """
-    session = get_live_session(
-        truck_id,
-        live_session_id
-    )
-    if not session:
-        return {
-            "status": "session_expired",
-            "session_expired": True,
-            "live_delivery_enabled": False,
-            "truck_id": truck_id,
-            "live_session_id": live_session_id,
-            "snapshots": []
-        }
-    cleanup_live_snapshots(session)
-    current_boot_id = session.get(
-        "current_boot_id"
-    )
-    snapshots = list(
-        session["snapshots"].values()
-    )
-    snapshots = [
-        snapshot
-        for snapshot in snapshots
-        if snapshot.get("boot_id") == current_boot_id
-        and int(snapshot.get("snapshot_seq", -1))
-            > int(after_seq)
-    ]
-    snapshots.sort(
-        key=lambda snapshot: int(
-            snapshot.get("snapshot_seq", -1)
-        )
-    )
-    latest_snapshot_seq = (
-        int(
-            snapshots[-1]["snapshot_seq"]
-        )
-        if snapshots
-        else int(after_seq)
-    )
-    clean_snapshots = []
-    for snapshot in snapshots:
-        clean_snapshot = {
-            key: value
-            for key, value in snapshot.items()
-            if key != "stored_at"
-        }
-        clean_snapshots.append(
-            clean_snapshot
-        )
     return {
         "status": "success",
-        "session_expired": False,
-        "live_delivery_enabled": True,
-        "truck_id": truck_id,
-        "live_session_id": live_session_id,
-        "boot_id": current_boot_id,
-        "latest_snapshot_seq": (
-            latest_snapshot_seq
-        ),
-        "snapshots": clean_snapshots
+        "processed_frames": len(payload.frames),
+        "snapshot_seq": truck_bucket["__stream__"]["snapshot_seq"],
+
+        # Útil para diagnóstico do sniffer e do backend.
+        "last_snapshot_received_at": now
     }
+
 
 @app.get("/signals")
 async def get_live_signals(truck_id: str = "Volvo FH540 (Sniffer 01)"):
@@ -2251,6 +1784,8 @@ def get_blackbox_events():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao buscar eventos: {str(e)}")
 
+
+@app.get("/api/blackbox/events/light")
 @app.get("/api/blackbox/events/light")
 def get_blackbox_events_light(response: Response):
     """
