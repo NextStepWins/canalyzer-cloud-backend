@@ -546,7 +546,11 @@ def cleanup_expired_viewer_leases():
             affected_trucks.add(
                 lease.get("truck_id")
             )
-
+    print(
+    "[LEASE] Lease expirado "
+    f"| truck={truck_id} "
+    f"| viewer={viewer_id}"
+    )
     for truck_id in affected_trucks:
         if truck_id:
             mode = get_effective_mode_for_truck(
@@ -2110,6 +2114,12 @@ def heartbeat_live_viewer(
 
     lease["last_heartbeat_at"] = time.time()
     lease["expires_at"] = expires_at
+    print(
+    "[LEASE] Heartbeat recebido "
+    f"| truck={payload.truck_id} "
+    f"| viewer={payload.viewer_id[:16]}... "
+    f"| expires_at={int(expires_at)}"
+    )
 
     """
     O comando ONLINE é republicado a cada heartbeat.
