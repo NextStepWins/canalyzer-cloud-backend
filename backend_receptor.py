@@ -2294,10 +2294,10 @@ def set_truck_state_endpoint(
         "manual_truck_state"
     )
     if effective_mode == "sentinel":
-    clear_live_snapshot(
-        truck_id,
-        "manual_truck_state"
-    )
+        clear_live_snapshot(
+            truck_id,
+            "manual_truck_state"
+        )
     return {
         "status": "success",
         "truck_id": truck_id,
