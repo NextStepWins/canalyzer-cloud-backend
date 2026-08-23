@@ -13,7 +13,6 @@ import re
 from collections import defaultdict
 import paho.mqtt.client as mqtt
 
-
 app = FastAPI(title="CANalyzer Pro Backend - Híbrido (Streaming & EDR)")
 
 app.add_middleware(
@@ -42,48 +41,69 @@ PENDING_BLACKBOX_TTL_SECONDS = 900
 # ============================================================================
 # MQTT, TELEMETRIA LIVE E LEASE DO VISUALIZADOR
 # ============================================================================
-# Telemetria MQTT:
-# - QoS 0
-# - melhor estado atual
-# - não há replay de snapshots antigos
+# MQTT live:
+# - ESP32 publica telemetry e status.
+# - Backend conserva somente o último snapshot confirmado.
+# - Não há histórico MQTT, backlog ou replay.
 #
-# Comando MQTT:
-# - QoS 1
-# - ONLINE apenas enquanto houver lease de visualizador ativo
-# - SENTINEL é o estado seguro padrão
+# EDR:
+# - Continua usando HTTP, chunks e PostgreSQL.
+# - Não é alterada por este bloco.
 # ============================================================================
 MQTT_HOST = os.getenv("MQTT_HOST", "")
-MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
-MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+MQTT_PORT = int(
+    os.getenv("MQTT_PORT", "8883")
+)
+MQTT_USERNAME = os.getenv(
+    "MQTT_USERNAME",
+    ""
+)
+MQTT_PASSWORD = os.getenv(
+    "MQTT_PASSWORD",
+    ""
+)
+MQTT_CLIENT_ID = os.getenv(
+    "MQTT_CLIENT_ID",
+    "backend-nic"
+)
 MQTT_TLS_ENABLED = (
     os.getenv(
         "MQTT_TLS_ENABLED",
         "true"
-    ).strip().lower()
+    )
+    .strip()
+    .lower()
     in {"1", "true", "yes", "on"}
 )
 MQTT_COMMAND_QOS = 1
 MQTT_TELEMETRY_QOS = 0
-
-LIVE_VIEWER_HEARTBEAT_SECONDS = 3.0
 LIVE_VIEWER_LEASE_SECONDS = 10.0
 
 mqtt_client = None
 mqtt_connected = False
 mqtt_lock = threading.Lock()
+live_state_lock = threading.Lock()
 
+"""
+viewer_leases:
+{
+    "viewer_<uuid>": {
+        "truck_id": "Volvo FH540 (Sniffer 01)",
+        "created_at": 0.0,
+        "last_heartbeat_at": 0.0,
+        "expires_at": 0.0
+    }
+}
+"""
 viewer_leases = {}
-
-# Evita publicar SENTINEL repetidamente a cada passagem do watchdog.
-last_effective_mode_by_truck = {}
-
 
 
 class HeartbeatTruckResponse(BaseModel):
     status: str
     user_is_monitoring: bool
     truck_id: str
+    live_viewer_active: bool = False
+    live_viewer_count: int = 0
 
 
 class BlackboxMetadata(BaseModel):
@@ -156,7 +176,6 @@ class LiveViewerHeartbeatPayload(BaseModel):
     viewer_id: str
 
 
-
 class BlackboxChunkUpload(BaseModel):
     upload_id: str
     chunk_index: int
@@ -203,31 +222,7 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
 
-def ensure_support_tables()
-
-@app.on_event("startup")
-def on_backend_startup():
-    start_mqtt_client()
-
-    watchdog = threading.Thread(
-        target=viewer_lease_watchdog,
-        daemon=True,
-        name="ViewerLeaseWatchdog"
-    )
-    watchdog.start()
-
-@app.on_event("shutdown")
-def on_backend_shutdown():
-    global mqtt_connected
-    mqtt_connected = False
-
-    if mqtt_client is not None:
-        try:
-            mqtt_client.loop_stop()
-            mqtt_client.disconnect()
-        except Exception:
-            pass
-:
+def ensure_support_tables():
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
@@ -249,32 +244,28 @@ def on_backend_shutdown():
     cursor.close()
     conn.close()
 
-
 ensure_support_tables()
 
 @app.on_event("startup")
 def on_backend_startup():
     start_mqtt_client()
-
-    watchdog = threading.Thread(
+    watchdog_thread = threading.Thread(
         target=viewer_lease_watchdog,
         daemon=True,
         name="ViewerLeaseWatchdog"
     )
-    watchdog.start()
+    watchdog_thread.start()
 
 @app.on_event("shutdown")
 def on_backend_shutdown():
     global mqtt_connected
     mqtt_connected = False
-
     if mqtt_client is not None:
         try:
             mqtt_client.loop_stop()
             mqtt_client.disconnect()
         except Exception:
             pass
-
 
 
 def sanitize_frame_dict(frame: Dict[str, Any]) -> Dict[str, Any]:
@@ -358,7 +349,8 @@ def ensure_live_bucket(truck_id: str):
 
 def mqtt_safe_truck_id(truck_id: str) -> str:
     """
-    Converte o nome de exibição em identificador seguro para tópico MQTT.
+    Converte o identificador de exibição do caminhão para um segmento
+    seguro de tópico MQTT.
     Exemplo:
     Volvo FH540 (Sniffer 01)
     ->
@@ -376,127 +368,70 @@ def mqtt_topic_for(
     truck_id: str,
     channel: str
 ) -> str:
-    safe_id = mqtt_safe_truck_id(truck_id)
     return (
-        f"canalyzer/v1/trucks/"
-        f"{safe_id}/{channel}"
+        "canalyzer/v1/trucks/"
+        f"{mqtt_safe_truck_id(truck_id)}"
+        f"/{channel}"
     )
 
 def get_active_viewer_count(
     truck_id: str
 ) -> int:
     now = time.time()
-    active_count = 0
-    for lease in viewer_leases.values():
+    return sum(
+        1
+        for lease in viewer_leases.values()
         if (
             lease.get("truck_id") == truck_id
             and float(
-                lease.get(
-                    "expires_at",
-                    0.0
-                )
+                lease.get("expires_at", 0.0)
             ) > now
-        ):
-            active_count += 1
-    return active_count
-
-def cleanup_expired_viewer_leases():
-    now = time.time()
-    expired_ids = [
-        viewer_id
-        for viewer_id, lease in viewer_leases.items()
-        if float(
-            lease.get(
-                "expires_at",
-                0.0
-            )
-        ) <= now
-    ]
-
-    affected_trucks = set()
-    for viewer_id in expired_ids:
-        lease = viewer_leases.pop(
-            viewer_id,
-            None
         )
-        if lease:
-            affected_trucks.add(
-                lease.get("truck_id")
-            )
-
-    for truck_id in affected_trucks:
-        if truck_id:
-            publish_effective_mode_for_truck(
-                truck_id,
-                "viewer_lease_expired"
-            )
+    )
 
 def get_effective_mode_for_truck(
     truck_id: str
 ) -> str:
     """
-    A decisão de ONLINE depende de:
-    - ao menos um visualizador com lease ativo;
-    - intenção online existente no backend.
-    Sem lease, SENTINEL é obrigatório.
+    ONLINE exige simultaneamente:
+    - intenção online do backend;
+    - ao menos um navegador com lease válido.
+    Sem visualizador ativo, o modo seguro é SENTINEL.
     """
-    cleanup_expired_viewer_leases_without_publish()
-
     truck_state = ensure_truck_state(truck_id)
     desired_state = truck_state.get(
         "desired_state",
         "sentinel"
     )
 
-    viewer_count = get_active_viewer_count(
+    active_viewers = get_active_viewer_count(
         truck_id
     )
 
     if (
         desired_state == "online"
-        and viewer_count > 0
+        and active_viewers > 0
     ):
         return "online"
 
     return "sentinel"
 
-def cleanup_expired_viewer_leases_without_publish():
-    """
-    Limpeza interna usada por get_effective_mode_for_truck().
-    Não publica MQTT aqui para evitar recursão com
-    publish_effective_mode_for_truck().
-    """
-    now = time.time()
-    expired_ids = [
-        viewer_id
-        for viewer_id, lease in viewer_leases.items()
-        if float(
-            lease.get(
-                "expires_at",
-                0.0
-            )
-        ) <= now
-    ]
-    for viewer_id in expired_ids:
-        viewer_leases.pop(
-            viewer_id,
-            None
-        )
-
 def publish_mqtt_mode_command(
     truck_id: str,
     mode: str,
     reason: str
-):
+) -> bool:
     """
+    Publica comando para o sniffer.
     ONLINE:
-    - QoS 1
-    - não retained
-    - lease curto, renovado por heartbeat do app
+    - QoS 1;
+    - não retained;
+    - lease de curta duração;
+    - heartbeat do navegador renova a autorização.
     SENTINEL:
-    - QoS 1
-    - retained
-    - garante estado seguro se o sniffer reconectar.
+    - QoS 1;
+    - retained;
+    - estado seguro caso o sniffer reconecte ao broker.
     """
     global mqtt_connected
 
@@ -504,6 +439,10 @@ def publish_mqtt_mode_command(
         mqtt_client is None
         or not mqtt_connected
     ):
+        print(
+            "[MQTT] Não conectado. "
+            f"Comando não publicado: {mode}"
+        )
         return False
 
     normalized_mode = (
@@ -535,36 +474,45 @@ def publish_mqtt_mode_command(
 
     try:
         with mqtt_lock:
-            info = mqtt_client.publish(
+            publish_info = mqtt_client.publish(
                 topic,
                 json.dumps(payload),
                 qos=MQTT_COMMAND_QOS,
                 retain=retain
             )
-        return (
-            info.rc == mqtt.MQTT_ERR_SUCCESS
+        published = (
+            publish_info.rc
+            == mqtt.MQTT_ERR_SUCCESS
         )
-    except Exception:
+
+        if published:
+            print(
+                "[MQTT] Comando publicado "
+                f"| truck={truck_id} "
+                f"| mode={normalized_mode} "
+                f"| reason={reason}"
+            )
+        else:
+            print(
+                "[MQTT] Falha ao publicar comando "
+                f"| rc={publish_info.rc}"
+            )
+
+        return published
+    except Exception as error:
+        print(
+            f"[MQTT] Erro publish command: {error}"
+        )
         return False
 
 def publish_effective_mode_for_truck(
     truck_id: str,
     reason: str
-):
+) -> str:
     """
-    Publica apenas quando o modo efetivo mudou.
-    Isso evita flood de comandos MQTT.
+    Avalia lease e intenção online, depois envia o comando efetivo.
     """
-    mode = get_effective_mode_for_truck(
-        truck_id
-    )
-
-    previous_mode = last_effective_mode_by_truck.get(
-        truck_id
-    )
-
-    if previous_mode == mode:
-        return mode
+    mode = get_effective_mode_for_truck(truck_id)
 
     publish_mqtt_mode_command(
         truck_id,
@@ -572,16 +520,52 @@ def publish_effective_mode_for_truck(
         reason
     )
 
-    last_effective_mode_by_truck[truck_id] = mode
-
     return mode
+
+def cleanup_expired_viewer_leases():
+    """
+    Remove leases expirados e manda SENTINEL para unidades que deixaram
+    de ter visualizadores ativos.
+    """
+    now = time.time()
+    expired_viewers = [
+        viewer_id
+        for viewer_id, lease in viewer_leases.items()
+        if float(
+            lease.get("expires_at", 0.0)
+        ) <= now
+    ]
+
+    affected_trucks = set()
+    for viewer_id in expired_viewers:
+        lease = viewer_leases.pop(
+            viewer_id,
+            None
+        )
+        if lease:
+            affected_trucks.add(
+                lease.get("truck_id")
+            )
+
+    for truck_id in affected_trucks:
+        if truck_id:
+            mode = get_effective_mode_for_truck(
+                truck_id
+            )
+            if mode == "sentinel":
+                publish_mqtt_mode_command(
+                    truck_id,
+                    "sentinel",
+                    "viewer_lease_expired"
+                )
 
 def update_live_snapshot_from_mqtt(
     payload: dict
 ):
     """
-    Atualiza somente o último snapshot live em memória.
-    Não grava histórico.
+    Atualiza o último snapshot completo da unidade.
+    Não acumula snapshots.
+    Não cria histórico.
     Não interfere com EDR.
     """
     if not isinstance(payload, dict):
@@ -592,6 +576,9 @@ def update_live_snapshot_from_mqtt(
     ).strip()
 
     if not truck_id:
+        print(
+            "[MQTT] Telemetria ignorada: truck_id ausente."
+        )
         return
 
     raw_frames = payload.get(
@@ -608,92 +595,94 @@ def update_live_snapshot_from_mqtt(
         if isinstance(frame, dict)
     ]
 
-    truck_bucket = ensure_live_bucket(
-        truck_id
-    )
-
-    now = time.time()
-
-    # Estado live é substituído integralmente.
-    truck_bucket["frames"] = sanitized_frames
-
-    truck_bucket["__stream__"][
-        "snapshot_seq"
-    ] += 1
-
-    truck_bucket["__stream__"][
-        "last_server_time"
-    ] = now
-
-    truck_bucket["__stream__"][
-        "last_snapshot_received_at"
-    ] = now
-
-    truck_bucket["__stream__"][
-        "snapshot_device_ms"
-    ] = payload.get(
-        "snapshot_device_ms"
-    )
-
-    truck_bucket["__stream__"][
-        "snapshot_unix_ms"
-    ] = payload.get(
-        "snapshot_unix_ms"
-    )
-
-    current_meta = truck_bucket.get(
-        "__meta__",
-        {}
-    )
-
-    truck_bucket["__meta__"] = {
-        "truck_id": truck_id,
-        "lat": payload.get(
-            "lat",
-            current_meta.get(
-                "lat",
-                -25.4284
-            )
-        ),
-        "lon": payload.get(
-            "lon",
-            current_meta.get(
-                "lon",
-                -49.2731
-            )
-        ),
-        "updated_at": now,
-        "mode": current_meta.get(
-            "mode",
-            "online"
-        ),
-        "priority_mode": current_meta.get(
-            "priority_mode",
-            False
-        ),
-        "pending_blackbox_upload": current_meta.get(
-            "pending_blackbox_upload",
-            False
-        ),
-        "blackbox_locked_until_upload": current_meta.get(
-            "blackbox_locked_until_upload",
-            False
-        ),
-        "last_error": current_meta.get(
-            "last_error",
-            ""
-        ),
-        "chunk_status": current_meta.get(
-            "chunk_status",
-            "idle"
+    with live_state_lock:
+        truck_bucket = ensure_live_bucket(
+            truck_id
         )
-    }
+
+        now = time.time()
+
+        """
+        O novo snapshot MQTT substitui integralmente o anterior.
+        Isso é intencional:
+        telemetria live mostra estado atual, não replay histórico.
+        """
+        truck_bucket["frames"] = sanitized_frames
+
+        truck_bucket["__stream__"][
+            "snapshot_seq"
+        ] += 1
+
+        truck_bucket["__stream__"][
+            "last_server_time"
+        ] = now
+
+        truck_bucket["__stream__"][
+            "last_snapshot_received_at"
+        ] = now
+
+        truck_bucket["__stream__"][
+            "snapshot_device_ms"
+        ] = payload.get(
+            "snapshot_device_ms"
+        )
+
+        truck_bucket["__stream__"][
+            "snapshot_unix_ms"
+        ] = payload.get(
+            "snapshot_unix_ms"
+        )
+
+        current_meta = truck_bucket.get(
+            "__meta__",
+            {}
+        )
+
+        truck_bucket["__meta__"] = {
+            "truck_id": truck_id,
+            "lat": payload.get(
+                "lat",
+                current_meta.get(
+                    "lat",
+                    -25.4284
+                )
+            ),
+            "lon": payload.get(
+                "lon",
+                current_meta.get(
+                    "lon",
+                    -49.2731
+                )
+            ),
+            "updated_at": now,
+            "mode": "online",
+            "priority_mode": current_meta.get(
+                "priority_mode",
+                False
+            ),
+            "pending_blackbox_upload": current_meta.get(
+                "pending_blackbox_upload",
+                False
+            ),
+            "blackbox_locked_until_upload": current_meta.get(
+                "blackbox_locked_until_upload",
+                False
+            ),
+            "last_error": current_meta.get(
+                "last_error",
+                ""
+            ),
+            "chunk_status": current_meta.get(
+                "chunk_status",
+                "idle"
+            )
+        }
 
 def update_truck_status_from_mqtt(
     payload: dict
 ):
     """
-    Atualiza presença e estado que já aparecem no painel Streamlit.
+    Atualiza os metadados de status exibidos pela lista de unidades.
     """
     if not isinstance(payload, dict):
         return
@@ -705,70 +694,71 @@ def update_truck_status_from_mqtt(
     if not truck_id:
         return
 
-    truck_bucket = ensure_live_bucket(
-        truck_id
-    )
-
-    current_meta = truck_bucket.get(
-        "__meta__",
-        {}
-    )
-
-    truck_bucket["__meta__"] = {
-        "truck_id": truck_id,
-        "lat": payload.get(
-            "lat",
-            current_meta.get(
-                "lat",
-                -25.4284
-            )
-        ),
-        "lon": payload.get(
-            "lon",
-            current_meta.get(
-                "lon",
-                -49.2731
-            )
-        ),
-        "updated_at": time.time(),
-        "mode": payload.get(
-            "mode",
-            current_meta.get(
-                "mode",
-                "sentinel"
-            )
-        ),
-        "priority_mode": bool(
-            payload.get(
-                "priority_mode",
-                False
-            )
-        ),
-        "pending_blackbox_upload": bool(
-            payload.get(
-                "pending_blackbox_upload",
-                False
-            )
-        ),
-        "blackbox_locked_until_upload": bool(
-            payload.get(
-                "blackbox_locked_until_upload",
-                False
-            )
-        ),
-        "last_error": str(
-            payload.get(
-                "last_error",
-                ""
-            )
-        ),
-        "chunk_status": str(
-            payload.get(
-                "chunk_status",
-                "idle"
-            )
+    with live_state_lock:
+        truck_bucket = ensure_live_bucket(
+            truck_id
         )
-    }
+
+        current_meta = truck_bucket.get(
+            "__meta__",
+            {}
+        )
+
+        truck_bucket["__meta__"] = {
+            "truck_id": truck_id,
+            "lat": payload.get(
+                "lat",
+                current_meta.get(
+                    "lat",
+                    -25.4284
+                )
+            ),
+            "lon": payload.get(
+                "lon",
+                current_meta.get(
+                    "lon",
+                    -49.2731
+                )
+            ),
+            "updated_at": time.time(),
+            "mode": payload.get(
+                "mode",
+                current_meta.get(
+                    "mode",
+                    "sentinel"
+                )
+            ),
+            "priority_mode": bool(
+                payload.get(
+                    "priority_mode",
+                    False
+                )
+            ),
+            "pending_blackbox_upload": bool(
+                payload.get(
+                    "pending_blackbox_upload",
+                    False
+                )
+            ),
+            "blackbox_locked_until_upload": bool(
+                payload.get(
+                    "blackbox_locked_until_upload",
+                    False
+                )
+            ),
+            "last_error": str(
+                payload.get(
+                    "last_error",
+                    ""
+                )
+            ),
+            "chunk_status": str(
+                payload.get(
+                    "chunk_status",
+                    "idle"
+                )
+            )
+        }
 
 def mqtt_on_connect(
     client,
@@ -784,6 +774,10 @@ def mqtt_on_connect(
     )
 
     if not mqtt_connected:
+        print(
+            "[MQTT] Conexão recusada "
+            f"| reason={reason_code}"
+        )
         return
 
     client.subscribe(
@@ -796,6 +790,11 @@ def mqtt_on_connect(
         qos=MQTT_COMMAND_QOS
     )
 
+    print(
+        "[MQTT] Backend conectado e inscrito "
+        "em telemetry/status."
+    )
+
 def mqtt_on_disconnect(
     client,
     userdata,
@@ -805,6 +804,10 @@ def mqtt_on_disconnect(
 ):
     global mqtt_connected
     mqtt_connected = False
+    print(
+        "[MQTT] Backend desconectado "
+        f"| reason={reason_code}"
+    )
 
 def mqtt_on_message(
     client,
@@ -816,6 +819,9 @@ def mqtt_on_message(
             message.payload.decode("utf-8")
         )
     except Exception:
+        print(
+            "[MQTT] JSON inválido recebido."
+        )
         return
 
     topic = str(message.topic or "")
@@ -833,9 +839,14 @@ def mqtt_on_message(
 
 def start_mqtt_client():
     """
-    Inicializa MQTT no mesmo processo FastAPI.
-    Para produção com múltiplos workers, o estado live deve ir para Redis.
-    Para o deployment atual, use somente um worker Uvicorn.
+    Inicializa cliente MQTT do backend.
+    Necessita:
+    MQTT_HOST
+    MQTT_PORT
+    MQTT_USERNAME
+    MQTT_PASSWORD
+    MQTT_CLIENT_ID
+    MQTT_TLS_ENABLED
     """
     global mqtt_client
     global mqtt_connected
@@ -843,20 +854,17 @@ def start_mqtt_client():
     if not MQTT_HOST:
         print(
             "[MQTT] MQTT_HOST não configurado. "
-            "Telemetria MQTT desabilitada."
+            "MQTT desabilitado."
         )
         return
 
     try:
-        client_id = (
-            f"canalyzer-backend-"
-            f"{uuid.uuid4().hex[:10]}"
-        )
-
         mqtt_client = mqtt.Client(
-            mqtt.CallbackAPIVersion.VERSION2,
-            client_id=client_id,
-            protocol=mqtt.MQTTv5
+            callback_api_version=(
+                mqtt.CallbackAPIVersion.VERSION2
+            ),
+            client_id=MQTT_CLIENT_ID,
+            protocol=mqtt.MQTTv311
         )
 
         if MQTT_USERNAME:
@@ -872,6 +880,11 @@ def start_mqtt_client():
         mqtt_client.on_disconnect = mqtt_on_disconnect
         mqtt_client.on_message = mqtt_on_message
 
+        mqtt_client.reconnect_delay_set(
+            min_delay=1,
+            max_delay=15
+        )
+
         mqtt_client.connect_async(
             MQTT_HOST,
             MQTT_PORT,
@@ -882,7 +895,10 @@ def start_mqtt_client():
         mqtt_connected = True
 
         print(
-            "[MQTT] Cliente backend iniciado."
+            "[MQTT] Cliente backend iniciado "
+            f"| host={MQTT_HOST}"
+            f"| port={MQTT_PORT}"
+            f"| client_id={MQTT_CLIENT_ID}"
         )
 
     except Exception as error:
@@ -895,10 +911,11 @@ def viewer_lease_watchdog():
     while True:
         try:
             cleanup_expired_viewer_leases()
-        except Exception:
-            pass
+        except Exception as error:
+            print(
+                f"[LEASE] Erro watchdog: {error}"
+            )
         time.sleep(1)
-
 
 
 def cleanup_stale_pending_blackbox_chunks():
@@ -1004,6 +1021,7 @@ def get_dtc_text(spn, fmi):
         "caption": f"SPN Não Catalogada ({spn})",
         "ftb": f"FMI Genérico ({fmi})"
     })
+
 def extract_blackbox_fault_context(raw_log):
     """
     Extrai as falhas DM1 presentes no raw_log de uma caixa-preta.
@@ -2023,8 +2041,6 @@ def persist_blackbox_record(metadata_dict, raw_log, log_format="raw_can"):
         "message": "Caixa preta armazenada no Supabase."
     }
 
-
-
 @app.post("/api/live-viewers/open")
 def open_live_viewer(
     payload: LiveViewerOpenPayload
@@ -2054,7 +2070,7 @@ def open_live_viewer(
     truck_state["user_is_monitoring"] = True
     truck_state["last_heartbeat_time"] = time.time()
 
-    publish_effective_mode_for_truck(
+    effective_mode = publish_effective_mode_for_truck(
         truck_id,
         "viewer_open"
     )
@@ -2063,6 +2079,7 @@ def open_live_viewer(
         "status": "opened",
         "truck_id": truck_id,
         "viewer_id": viewer_id,
+        "effective_mode": effective_mode,
         "lease_expires_at_ms": int(
             expires_at * 1000
         )
@@ -2079,7 +2096,7 @@ def heartbeat_live_viewer(
     if (
         not lease
         or lease.get("truck_id")
-            != payload.truck_id
+        != payload.truck_id
     ):
         return {
             "status": "expired",
@@ -2094,8 +2111,13 @@ def heartbeat_live_viewer(
     lease["last_heartbeat_at"] = time.time()
     lease["expires_at"] = expires_at
 
-    publish_effective_mode_for_truck(
+    """
+    O comando ONLINE é republicado a cada heartbeat.
+    Isso renova o lease local no sniffer.
+    """
+    publish_mqtt_mode_command(
         payload.truck_id,
+        "online",
         "viewer_heartbeat"
     )
 
@@ -2122,14 +2144,15 @@ def close_live_viewer(
         else payload.truck_id
     )
 
-    publish_effective_mode_for_truck(
+    effective_mode = publish_effective_mode_for_truck(
         truck_id,
         "viewer_closed"
     )
 
     return {
         "status": "closed",
-        "truck_id": truck_id
+        "truck_id": truck_id,
+        "effective_mode": effective_mode
     }
 
 @app.post("/api/truck-state/{truck_id}")
@@ -2194,19 +2217,39 @@ def set_truck_state_endpoint(
         )
     }
 
-
 @app.get("/api/status/{truck_id}")
-async def check_system_status_for_truck(truck_id: str) -> HeartbeatTruckResponse:
-    truck_state = ensure_truck_state(truck_id)
-    desired_state = truck_state.get("desired_state", "sentinel")
-    truck_state["user_is_monitoring"] = (desired_state == "online")
+async def check_system_status_for_truck(
+    truck_id: str
+) -> HeartbeatTruckResponse:
+    cleanup_expired_viewer_leases()
+
+    truck_state = ensure_truck_state(
+        truck_id
+    )
+
+    viewer_count = get_active_viewer_count(
+        truck_id
+    )
+
+    effective_mode = get_effective_mode_for_truck(
+        truck_id
+    )
+
+    truck_state["user_is_monitoring"] = (
+        effective_mode == "online"
+    )
 
     return HeartbeatTruckResponse(
         status="ok",
-        user_is_monitoring=truck_state["user_is_monitoring"],
-        truck_id=truck_id
+        truck_id=truck_id,
+        user_is_monitoring=(
+            effective_mode == "online"
+        ),
+        live_viewer_active=(
+            viewer_count > 0
+        ),
+        live_viewer_count=viewer_count
     )
-
 
 @app.post("/api/trucks/register")
 def register_truck(payload: TruckRegisterPayload):
@@ -2239,8 +2282,6 @@ def register_truck(payload: TruckRegisterPayload):
         "truck_id": payload.truck_id
     }
 
-
-@app.get("/api/trucks/online")
 
 @app.get("/api/trucks/online")
 def get_online_trucks():
@@ -2389,15 +2430,14 @@ async def upload_live_signals(payload: LiveSignalsPayload):
         "last_snapshot_received_at": now
     }
 
-
 @app.get("/signals")
 async def get_live_signals(
     truck_id: str = "Volvo FH540 (Sniffer 01)"
 ):
     """
-    Retorna o último snapshot MQTT confirmado.
-    A leitura não é destrutiva. O frontend já usa snapshot_seq para
-    ignorar a mesma atualização mais de uma vez.
+    Retorna o último snapshot completo recebido por MQTT.
+    Não limpa frames após o GET.
+    O frontend identifica novidade usando snapshot_seq.
     """
     if truck_id not in live_signals_db:
         return {
@@ -2410,35 +2450,72 @@ async def get_live_signals(
             "snapshot_unix_ms": None
         }
 
-    truck_data = ensure_live_bucket(
-        truck_id
-    )
+    with live_state_lock:
+        truck_data = ensure_live_bucket(
+            truck_id
+        )
 
-    meta = truck_data.get(
-        "__meta__",
-        {}
-    )
+        meta = truck_data.get(
+            "__meta__",
+            {}
+        )
 
-    stream = truck_data.get(
-        "__stream__",
-        {}
-    )
+        stream = truck_data.get(
+            "__stream__",
+            {}
+        )
 
-    updated_at = float(
-        meta.get(
-            "updated_at",
-            0.0
-        ) or 0.0
-    )
+        updated_at = float(
+            meta.get(
+                "updated_at",
+                0.0
+            ) or 0.0
+        )
 
-    if (
-        time.time() - updated_at
-        > LIVE_DATA_TIMEOUT_SECONDS
-    ):
+        if (
+            time.time() - updated_at
+            > LIVE_DATA_TIMEOUT_SECONDS
+        ):
+            return {
+                "status": "stale",
+                "frames": [],
+                "truck_id": truck_id,
+                "lat": meta.get(
+                    "lat",
+                    -25.4284
+                ),
+                "lon": meta.get(
+                    "lon",
+                    -49.2731
+                ),
+                "snapshot_seq": stream.get(
+                    "snapshot_seq",
+                    0
+                ),
+                "server_time": time.time(),
+                "snapshot_device_ms": stream.get(
+                    "snapshot_device_ms"
+                ),
+                "snapshot_unix_ms": stream.get(
+                    "snapshot_unix_ms"
+                )
+            }
+
+        frames_to_deliver = [
+            sanitize_frame_dict(frame)
+            for frame in truck_data.get(
+                "frames",
+                []
+            )
+        ]
+
         return {
-            "status": "stale",
-            "frames": [],
-            "truck_id": truck_id,
+            "status": "success",
+            "frames": frames_to_deliver,
+            "truck_id": meta.get(
+                "truck_id",
+                truck_id
+            ),
             "lat": meta.get(
                 "lat",
                 -25.4284
@@ -2451,7 +2528,10 @@ async def get_live_signals(
                 "snapshot_seq",
                 0
             ),
-            "server_time": time.time(),
+            "server_time": stream.get(
+                "last_server_time",
+                time.time()
+            ),
             "snapshot_device_ms": stream.get(
                 "snapshot_device_ms"
             ),
@@ -2459,44 +2539,6 @@ async def get_live_signals(
                 "snapshot_unix_ms"
             )
         }
-
-    return {
-        "status": "success",
-        "frames": [
-            sanitize_frame_dict(frame)
-            for frame in truck_data.get(
-                "frames",
-                []
-            )
-        ],
-        "truck_id": meta.get(
-            "truck_id",
-            truck_id
-        ),
-        "lat": meta.get(
-            "lat",
-            -25.4284
-        ),
-        "lon": meta.get(
-            "lon",
-            -49.2731
-        ),
-        "snapshot_seq": stream.get(
-            "snapshot_seq",
-            0
-        ),
-        "server_time": stream.get(
-            "last_server_time",
-            time.time()
-        ),
-        "snapshot_device_ms": stream.get(
-            "snapshot_device_ms"
-        ),
-        "snapshot_unix_ms": stream.get(
-            "snapshot_unix_ms"
-        )
-    }
-
 
 @app.post("/api/blackbox/upload")
 def upload_blackbox_log(payload: BlackboxUpload):
@@ -2634,7 +2676,6 @@ def get_blackbox_events():
         raise HTTPException(status_code=500, detail=f"Erro ao buscar eventos: {str(e)}")
 
 
-@app.get("/api/blackbox/events/light")
 @app.get("/api/blackbox/events/light")
 def get_blackbox_events_light(response: Response):
     """
