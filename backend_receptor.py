@@ -350,7 +350,7 @@ def clear_live_snapshot(
         "[LIVE] Snapshot live limpo "
         f"| truck={truck_id} "
         f"| reason={reason}"
-    )]
+    )
 
 def mqtt_safe_truck_id(truck_id: str) -> str:
     """
