@@ -302,50 +302,55 @@ def ensure_truck_state(truck_id: str):
     return SYSTEM_STATE["monitoring_by_truck"][truck_id]
 
 
-def ensure_live_bucket(truck_id: str):
-    if truck_id not in live_signals_db:
-        live_signals_db[truck_id] = {
-            "frames": [],
-            "__meta__": {},
-            "__stream__": {
-                "snapshot_seq": 0,
-                "last_server_time": 0.0,
+def clear_live_snapshot(
+    truck_id: str,
+    reason: str = ""
+):
+    """
+    Remove somente o estado live MQTT em memória.
 
-                # Timestamp exclusivo para confirmar que o backend
-                # recebeu um snapshot CAN em POST /signals.
-                "last_snapshot_received_at": 0.0,
+    Não altera EDR, chunks, blackbox_logs ou dados persistidos no banco.
+    """
+    with live_state_lock:
+        truck_bucket = ensure_live_bucket(
+            truck_id
+        )
 
-                "snapshot_device_ms": None,
-                "snapshot_unix_ms": None
-            }
-        }
-    else:
-        if "__stream__" not in live_signals_db[truck_id]:
-            live_signals_db[truck_id]["__stream__"] = {
-                "snapshot_seq": 0,
-                "last_server_time": 0.0,
-                "last_snapshot_received_at": 0.0,
-                "snapshot_device_ms": None,
-                "snapshot_unix_ms": None
-            }
+        truck_bucket["frames"] = []
 
-        if "__meta__" not in live_signals_db[truck_id]:
-            live_signals_db[truck_id]["__meta__"] = {}
+        stream = truck_bucket.get(
+            "__stream__",
+            {}
+        )
 
-        if "frames" not in live_signals_db[truck_id]:
-            live_signals_db[truck_id]["frames"] = []
+        """
+        Não zere snapshot_seq.
 
-        # Compatibilidade com buckets criados antes deste patch.
-        # Evita KeyError enquanto o backend estiver em execução.
-        if (
-            "last_snapshot_received_at"
-            not in live_signals_db[truck_id]["__stream__"]
-        ):
-            live_signals_db[truck_id]["__stream__"][
-                "last_snapshot_received_at"
-            ] = 0.0
+        Mantê-lo monotônico evita que o frontend confunda uma sessão nova
+        com uma sequência antiga.
+        """
+        stream["last_server_time"] = time.time()
+        stream["last_snapshot_received_at"] = 0.0
+        stream["snapshot_device_ms"] = None
+        stream["snapshot_unix_ms"] = None
 
-    return live_signals_db[truck_id]
+        truck_bucket["__stream__"] = stream
+
+        meta = truck_bucket.get(
+            "__meta__",
+            {}
+        )
+
+        meta["updated_at"] = 0.0
+        meta["mode"] = "sentinel"
+
+        truck_bucket["__meta__"] = meta
+
+    print(
+        "[LIVE] Snapshot live limpo "
+        f"| truck={truck_id} "
+        f"| reason={reason}"
+    )]
 
 def mqtt_safe_truck_id(truck_id: str) -> str:
     """
@@ -557,11 +562,16 @@ def cleanup_expired_viewer_leases():
                 truck_id
             )
             if mode == "sentinel":
-                publish_mqtt_mode_command(
-                    truck_id,
-                    "sentinel",
-                    "viewer_lease_expired"
-                )
+    publish_mqtt_mode_command(
+        truck_id,
+        "sentinel",
+        "viewer_lease_expired"
+    )
+
+    clear_live_snapshot(
+        truck_id,
+        "viewer_lease_expired"
+    )
 
 def update_live_snapshot_from_mqtt(
     payload: dict
@@ -2097,38 +2107,85 @@ def heartbeat_live_viewer(
         payload.viewer_id
     )
 
-    if (
-        not lease
-        or lease.get("truck_id")
-        != payload.truck_id
-    ):
+    now = time.time()
+
+    """
+    Caso comum:
+    o navegador voltou depois de perder conexão ou ficar fechado
+    tempo suficiente para a lease expirar.
+
+    Em vez de retornar somente "expired", recriamos a lease usando o
+    mesmo viewer_id que o iframe ainda possui.
+    """
+    if lease is None:
+        expires_at = (
+            now
+            + LIVE_VIEWER_LEASE_SECONDS
+        )
+
+        viewer_leases[payload.viewer_id] = {
+            "truck_id": payload.truck_id,
+            "created_at": now,
+            "last_heartbeat_at": now,
+            "expires_at": expires_at
+        }
+
+        truck_state = ensure_truck_state(
+            payload.truck_id
+        )
+
+        truck_state["desired_state"] = "online"
+        truck_state["user_is_monitoring"] = True
+        truck_state["last_heartbeat_time"] = now
+
+        publish_mqtt_mode_command(
+            payload.truck_id,
+            "online",
+            "viewer_resumed"
+        )
+
+        print(
+            "[LEASE] Viewer retomado "
+            f"| truck={payload.truck_id} "
+            f"| viewer={payload.viewer_id[:16]}..."
+        )
+
         return {
-            "status": "expired",
+            "status": "resumed",
+            "viewer_active": True,
+            "lease_expires_at_ms": int(
+                expires_at * 1000
+            )
+        }
+
+    """
+    Não permita que um viewer_id existente seja usado para outro
+    caminhão.
+    """
+    if lease.get("truck_id") != payload.truck_id:
+        return {
+            "status": "invalid_viewer",
             "viewer_active": False
         }
 
     expires_at = (
-        time.time()
+        now
         + LIVE_VIEWER_LEASE_SECONDS
     )
 
-    lease["last_heartbeat_at"] = time.time()
+    lease["last_heartbeat_at"] = now
     lease["expires_at"] = expires_at
-    print(
-    "[LEASE] Heartbeat recebido "
-    f"| truck={payload.truck_id} "
-    f"| viewer={payload.viewer_id[:16]}... "
-    f"| expires_at={int(expires_at)}"
-    )
 
-    """
-    O comando ONLINE é republicado a cada heartbeat.
-    Isso renova o lease local no sniffer.
-    """
     publish_mqtt_mode_command(
         payload.truck_id,
         "online",
         "viewer_heartbeat"
+    )
+
+    print(
+        "[LEASE] Heartbeat recebido "
+        f"| truck={payload.truck_id} "
+        f"| viewer={payload.viewer_id[:16]}..."
     )
 
     return {
@@ -2158,6 +2215,16 @@ def close_live_viewer(
         truck_id,
         "viewer_closed"
     )
+
+    """
+    Se não há mais viewers ativos, a unidade deve entrar em Sentinel e
+    o snapshot live antigo não deve sobreviver para a próxima sessão.
+    """
+    if effective_mode == "sentinel":
+        clear_live_snapshot(
+            truck_id,
+            "viewer_closed"
+        )
 
     return {
         "status": "closed",
@@ -2216,7 +2283,11 @@ def set_truck_state_endpoint(
         truck_id,
         "manual_truck_state"
     )
-
+    if effective_mode == "sentinel":
+    clear_live_snapshot(
+        truck_id,
+        "manual_truck_state"
+    )
     return {
         "status": "success",
         "truck_id": truck_id,
