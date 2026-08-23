@@ -533,6 +533,7 @@ def cleanup_expired_viewer_leases():
     de ter visualizadores ativos.
     """
     now = time.time()
+
     expired_viewers = [
         viewer_id
         for viewer_id, lease in viewer_leases.items()
@@ -542,36 +543,45 @@ def cleanup_expired_viewer_leases():
     ]
 
     affected_trucks = set()
+
     for viewer_id in expired_viewers:
         lease = viewer_leases.pop(
             viewer_id,
             None
         )
-        if lease:
-            affected_trucks.add(
-                lease.get("truck_id")
-            )
-    print(
-    "[LEASE] Lease expirado "
-    f"| truck={truck_id} "
-    f"| viewer={viewer_id}"
-    )
-    for truck_id in affected_trucks:
-        if truck_id:
-            mode = get_effective_mode_for_truck(
-                truck_id
-            )
-            if mode == "sentinel":
-    publish_mqtt_mode_command(
-        truck_id,
-        "sentinel",
-        "viewer_lease_expired"
-    )
 
-    clear_live_snapshot(
-        truck_id,
-        "viewer_lease_expired"
-    )
+        if lease:
+            expired_truck_id = lease.get(
+                "truck_id"
+            )
+
+            print(
+                "[LEASE] Lease expirado "
+                f"| truck={expired_truck_id} "
+                f"| viewer={viewer_id}"
+            )
+
+            if expired_truck_id:
+                affected_trucks.add(
+                    expired_truck_id
+                )
+
+    for truck_id in affected_trucks:
+        mode = get_effective_mode_for_truck(
+            truck_id
+        )
+
+        if mode == "sentinel":
+            publish_mqtt_mode_command(
+                truck_id,
+                "sentinel",
+                "viewer_lease_expired"
+            )
+
+            clear_live_snapshot(
+                truck_id,
+                "viewer_lease_expired"
+            )
 
 def update_live_snapshot_from_mqtt(
     payload: dict
