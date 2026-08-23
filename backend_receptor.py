@@ -301,6 +301,62 @@ def ensure_truck_state(truck_id: str):
         SYSTEM_STATE["monitoring_by_truck"][truck_id]["desired_state"] = "sentinel"
     return SYSTEM_STATE["monitoring_by_truck"][truck_id]
 
+def ensure_live_bucket(truck_id: str):
+    """
+    Retorna o bucket live da unidade, criando sua estrutura caso ainda
+    não exista.
+
+    Esse estado fica somente em memória e contém o último snapshot MQTT
+    recebido da unidade.
+    """
+    if truck_id not in live_signals_db:
+        live_signals_db[truck_id] = {
+            "frames": [],
+            "__meta__": {},
+            "__stream__": {
+                "snapshot_seq": 0,
+                "last_server_time": 0.0,
+                "last_snapshot_received_at": 0.0,
+                "snapshot_device_ms": None,
+                "snapshot_unix_ms": None
+            }
+        }
+    else:
+        truck_bucket = live_signals_db[truck_id]
+
+        if "frames" not in truck_bucket:
+            truck_bucket["frames"] = []
+
+        if "__meta__" not in truck_bucket:
+            truck_bucket["__meta__"] = {}
+
+        if "__stream__" not in truck_bucket:
+            truck_bucket["__stream__"] = {
+                "snapshot_seq": 0,
+                "last_server_time": 0.0,
+                "last_snapshot_received_at": 0.0,
+                "snapshot_device_ms": None,
+                "snapshot_unix_ms": None
+            }
+        else:
+            stream = truck_bucket["__stream__"]
+
+            if "snapshot_seq" not in stream:
+                stream["snapshot_seq"] = 0
+
+            if "last_server_time" not in stream:
+                stream["last_server_time"] = 0.0
+
+            if "last_snapshot_received_at" not in stream:
+                stream["last_snapshot_received_at"] = 0.0
+
+            if "snapshot_device_ms" not in stream:
+                stream["snapshot_device_ms"] = None
+
+            if "snapshot_unix_ms" not in stream:
+                stream["snapshot_unix_ms"] = None
+
+    return live_signals_db[truck_id]
 
 def clear_live_snapshot(
     truck_id: str,
