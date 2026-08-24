@@ -925,24 +925,57 @@ def mqtt_on_message(
         payload = json.loads(
             message.payload.decode("utf-8")
         )
-    except Exception:
+    except Exception as error:
         print(
-            "[MQTT] JSON inválido recebido."
+            "[MQTT] JSON inválido recebido"
+            f" | topic={message.topic}"
+            f" | erro={error}"
         )
         return
 
     topic = str(message.topic or "")
 
     if topic.endswith("/telemetry"):
-        update_live_snapshot_from_mqtt(
-            payload
+        raw_frames = payload.get("frames", [])
+        dm1_frames = []
+
+        for frame in raw_frames:
+            if not isinstance(frame, dict):
+                continue
+
+            try:
+                can_id = int(frame.get("id", 0) or 0)
+                meta = decode_j1939_id(can_id)
+
+                if meta.get("pgn") == 65226:
+                    dm1_frames.append({
+                        "id_hex": f"0x{can_id:08X}",
+                        "source_address": (
+                            f"0x{meta.get('sa', 0):02X}"
+                        ),
+                        "dlc": frame.get("dlc"),
+                        "data": frame.get("d")
+                    })
+            except Exception as error:
+                print(
+                    "[MQTT RX] Frame inválido"
+                    f" | erro={error}"
+                )
+
+        print(
+            "[MQTT RX TELEMETRY]"
+            f" | topic={topic}"
+            f" | truck={payload.get('truck_id')}"
+            f" | frames={len(raw_frames)}"
+            f" | dm1_count={len(dm1_frames)}"
+            f" | dm1={dm1_frames}"
         )
+
+        update_live_snapshot_from_mqtt(payload)
         return
 
     if topic.endswith("/status"):
-        update_truck_status_from_mqtt(
-            payload
-        )
+        update_truck_status_from_mqtt(payload)
 
 def start_mqtt_client():
     """
