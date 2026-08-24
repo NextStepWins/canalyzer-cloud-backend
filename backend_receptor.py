@@ -875,34 +875,6 @@ def mqtt_on_connect(
         "em telemetry/status."
     )
 
-    """
-    Um comando SENTINEL é retained no broker por segurança.
-
-    Portanto, quando o backend reconecta, um sniffer também reconectado
-    pode receber primeiro esse SENTINEL retained. Se ainda existe viewer
-    ativo com lease válida, republicamos ONLINE imediatamente.
-    """
-    active_trucks = {
-        lease.get("truck_id")
-        for lease in viewer_leases.values()
-        if (
-            lease.get("truck_id")
-            and float(lease.get("expires_at", 0.0)) > time.time()
-        )
-    }
-
-    for truck_id in active_trucks:
-        effective_mode = publish_effective_mode_for_truck(
-            truck_id,
-            "mqtt_backend_reconnected"
-        )
-
-        print(
-            "[MQTT] Modo republicado após reconexão "
-            f"| truck={truck_id} "
-            f"| mode={effective_mode}"
-        )
-
 def mqtt_on_disconnect(
     client,
     userdata,
