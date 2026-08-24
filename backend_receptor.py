@@ -33,6 +33,7 @@ SYSTEM_STATE = {
 }
 
 live_signals_db = {}
+live_dm1_db = {}
 LIVE_DATA_TIMEOUT_SECONDS = 5.0
 MAX_LIVE_FRAMES_PER_TRUCK = 2000
 BLACKBOX_EVENTS_LIGHT_LIMIT = 100
@@ -119,6 +120,32 @@ class BlackboxUpload(BaseModel):
     log: List[Dict[str, Any]]
     log_format: Optional[str] = "raw_can"
 
+
+class LiveDm1Payload(BaseModel):
+    truck_id: str
+    device_id: str | None = None
+    device_ms: int
+    unix_ms: int | None = None
+    can_id: int
+    source_address: int
+    dlc: int
+    data: List[int]
+    has_active_dtc: bool | None = None
+
+    @field_validator("dlc")
+    @classmethod
+    def validate_dm1_dlc(cls, value):
+        return max(0, min(int(value), 8))
+
+    @field_validator("data")
+    @classmethod
+    def validate_dm1_data(cls, value):
+        if not isinstance(value, list):
+            return []
+        return [
+            int(byte) & 0xFF
+            for byte in value[:8]
+        ]
 
 class CanFrame(BaseModel):
     t: int
@@ -215,6 +242,36 @@ J1939_NODE_NAMES = {
     0xFF: "Global"
 }
 
+
+def dm1_has_active_dtc(
+    data: List[int],
+    dlc: int
+) -> bool:
+    """
+    Regra oficial da aplicação:
+    - DM1 é recebida sempre;
+    - só há falha ativa quando a primeira DTC existe;
+    - FF FF FF FF em bytes 2..5 significa nenhuma DTC;
+    - SPN 0 também não é aceito como DTC válida.
+    """
+    if not isinstance(data, list) or dlc < 6:
+        return False
+
+    padded = (
+        [int(value) & 0xFF for value in data[:8]]
+        + [0xFF] * 8
+    )[:8]
+
+    if padded[2:6] == [0xFF, 0xFF, 0xFF, 0xFF]:
+        return False
+
+    spn = (
+        padded[2]
+        | (padded[3] << 8)
+        | ((padded[4] & 0x07) << 16)
+    )
+
+    return spn != 0
 
 def get_db_connection():
     if not DATABASE_URL:
@@ -874,33 +931,6 @@ def mqtt_on_connect(
         "[MQTT] Backend conectado e inscrito "
         "em telemetry/status."
     )
-    """
-    Um comando SENTINEL é retained no broker por segurança.
-
-    Portanto, quando o backend reconecta, um sniffer também reconectado
-    pode receber primeiro esse SENTINEL retained. Se ainda existe viewer
-    ativo com lease válida, republicamos ONLINE imediatamente.
-    """
-    active_trucks = {
-        lease.get("truck_id")
-        for lease in viewer_leases.values()
-        if (
-            lease.get("truck_id")
-            and float(lease.get("expires_at", 0.0)) > time.time()
-        )
-    }
-
-    for truck_id in active_trucks:
-        effective_mode = publish_effective_mode_for_truck(
-            truck_id,
-            "mqtt_backend_reconnected"
-        )
-
-        print(
-            "[MQTT] Modo republicado após reconexão "
-            f"| truck={truck_id} "
-            f"| mode={effective_mode}"
-        )
 
 def mqtt_on_disconnect(
     client,
@@ -925,57 +955,24 @@ def mqtt_on_message(
         payload = json.loads(
             message.payload.decode("utf-8")
         )
-    except Exception as error:
+    except Exception:
         print(
-            "[MQTT] JSON inválido recebido"
-            f" | topic={message.topic}"
-            f" | erro={error}"
+            "[MQTT] JSON inválido recebido."
         )
         return
 
     topic = str(message.topic or "")
 
     if topic.endswith("/telemetry"):
-        raw_frames = payload.get("frames", [])
-        dm1_frames = []
-
-        for frame in raw_frames:
-            if not isinstance(frame, dict):
-                continue
-
-            try:
-                can_id = int(frame.get("id", 0) or 0)
-                meta = decode_j1939_id(can_id)
-
-                if meta.get("pgn") == 65226:
-                    dm1_frames.append({
-                        "id_hex": f"0x{can_id:08X}",
-                        "source_address": (
-                            f"0x{meta.get('sa', 0):02X}"
-                        ),
-                        "dlc": frame.get("dlc"),
-                        "data": frame.get("d")
-                    })
-            except Exception as error:
-                print(
-                    "[MQTT RX] Frame inválido"
-                    f" | erro={error}"
-                )
-
-        print(
-            "[MQTT RX TELEMETRY]"
-            f" | topic={topic}"
-            f" | truck={payload.get('truck_id')}"
-            f" | frames={len(raw_frames)}"
-            f" | dm1_count={len(dm1_frames)}"
-            f" | dm1={dm1_frames}"
+        update_live_snapshot_from_mqtt(
+            payload
         )
-
-        update_live_snapshot_from_mqtt(payload)
         return
 
     if topic.endswith("/status"):
-        update_truck_status_from_mqtt(payload)
+        update_truck_status_from_mqtt(
+            payload
+        )
 
 def start_mqtt_client():
     """
@@ -2570,6 +2567,100 @@ def get_online_trucks():
 
     return {
         "trucks": trucks
+    }
+
+@app.post("/api/dm1/live")
+def receive_live_dm1(
+    payload: LiveDm1Payload
+):
+    frame_data = payload.data[:payload.dlc]
+
+    active_dtc = dm1_has_active_dtc(
+        frame_data,
+        payload.dlc
+    )
+
+    parsed = decode_dm1(
+        frame_data
+    )
+
+    source_address = (
+        int(payload.source_address)
+        & 0xFF
+    )
+
+    with live_state_lock:
+        live_dm1_db[payload.truck_id] = {
+            "truck_id": payload.truck_id,
+            "device_id": payload.device_id,
+            "received_at": time.time(),
+            "device_ms": payload.device_ms,
+            "unix_ms": payload.unix_ms,
+            "can_id": int(payload.can_id),
+            "source_address": source_address,
+            "dlc": payload.dlc,
+            "data": frame_data,
+            # O backend recalcula o valor e não confia
+            # apenas no booleano recebido do ESP32.
+            "has_active_dtc": active_dtc,
+            "decoded": parsed,
+        }
+
+    print(
+        "[DM1 HTTP]"
+        f" | truck={payload.truck_id}"
+        f" | sa=0x{source_address:02X}"
+        f" | active_dtc={active_dtc}"
+        f" | data={frame_data}"
+    )
+
+    return {
+        "status": "accepted",
+        "truck_id": payload.truck_id,
+        "has_active_dtc": active_dtc,
+        "received_at": time.time(),
+    }
+
+@app.get("/api/dm1/live")
+def get_live_dm1(
+    truck_id: str = "Volvo FH540 (Sniffer 01)"
+):
+    dm1_state = live_dm1_db.get(truck_id)
+
+    if not dm1_state:
+        return {
+            "status": "empty",
+            "truck_id": truck_id,
+            "has_active_dtc": False,
+            "dm1": None,
+        }
+
+    age_seconds = max(
+        0.0,
+        time.time()
+        - float(
+            dm1_state.get(
+                "received_at",
+                0.0
+            )
+        )
+    )
+
+    return {
+        "status": (
+            "success"
+            if age_seconds <= 5.0
+            else "stale"
+        ),
+        "truck_id": truck_id,
+        "age_seconds": round(age_seconds, 3),
+        "has_active_dtc": bool(
+            dm1_state.get(
+                "has_active_dtc",
+                False
+            )
+        ),
+        "dm1": dm1_state,
     }
 
 @app.post("/signals")
